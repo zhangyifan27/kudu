@@ -58,6 +58,7 @@ namespace kudu {
 namespace rebalance {
 
 Rebalancer::Config::Config(
+    std::vector<std::string> blacklist_tservers,
     vector<string> ignored_tservers_param,
     vector<string> master_addresses,
     vector<string> table_filters,
@@ -70,7 +71,8 @@ Rebalancer::Config::Config(
     bool run_cross_location_rebalancing,
     bool run_intra_location_rebalancing,
     double load_imbalance_threshold)
-    : ignored_tservers(ignored_tservers_param.begin(), ignored_tservers_param.end()),
+    : blacklist_tservers(std::move(blacklist_tservers)),
+      ignored_tservers(ignored_tservers_param.begin(), ignored_tservers_param.end()),
       master_addresses(std::move(master_addresses)),
       table_filters(std::move(table_filters)),
       max_moves_per_server(max_moves_per_server),
@@ -103,7 +105,9 @@ Rebalancer::Rebalancer(Config config)
 // when no other candidates are left.
 Status Rebalancer::FindReplicas(const TableReplicaMove& move,
                                 const ClusterRawInfo& raw_info,
-                                vector<string>* tablet_ids) {
+                                vector<string>* tablet_ids,
+                                bool *is_healthy_move) {
+  tablet_ids->clear();
   const auto& table_id = move.table_id;
 
   // Tablet ids of replicas on the source tserver that are non-leaders.
@@ -149,6 +153,12 @@ Status Rebalancer::FindReplicas(const TableReplicaMove& move,
       }
     }
   }
+  if (tablet_uuids_src.empty() && tablet_uuids_src_leaders.empty()) {
+    // No healthy tablet of specific table at source server
+    *is_healthy_move = false;
+    return Status::OK();
+  }
+
   sort(tablet_uuids_src.begin(), tablet_uuids_src.end());
   sort(tablet_uuids_dst.begin(), tablet_uuids_dst.end());
 
@@ -318,7 +328,7 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
 
   for (const auto& tablet : raw_info.tablet_summaries) {
     if (!config_.move_rf1_replicas) {
-      if (rf1_tables.find(tablet.table_id) != rf1_tables.end()) {
+      if (ContainsKey(rf1_tables, tablet.table_id)) {
         LOG(INFO) << Substitute("tablet $0 of table '$1' ($2) has single replica, skipping",
                                 tablet.id, tablet.table_name, tablet.table_id);
         continue;
@@ -429,6 +439,23 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
     }
     table_info_by_skew.emplace(max_count - min_count, std::move(tbi));
   }
+
+  // Populate ClusterInfo::blacklist_tservers
+  auto& blacklist_tservers_info = result_info.blacklist_tservers;
+  for (const auto& blacklist_tserver : config_.blacklist_tservers) {
+    if (!ContainsKey(tserver_replicas_count, blacklist_tserver)) {
+      return Status::InvalidArgument(Substitute(
+          "blacklist tserver $0 is not reported among known tservers", blacklist_tserver));
+    }
+    ReplicaCountByTable replica_count_by_table;
+    for (const auto& elem : table_replicas_info) {
+      const auto& table_id = elem.first;
+      auto& replica_count = LookupOrEmplace(&replica_count_by_table, table_id, 0);
+      replica_count += FindOrDie(elem.second, blacklist_tserver);
+    }
+    blacklist_tservers_info.emplace(blacklist_tserver, std::move(replica_count_by_table));
+  }
+
   // TODO(aserbin): add sanity checks on the result.
   *info = std::move(result_info);
 

@@ -38,7 +38,9 @@ using kudu::cluster_summary::TableSummary;
 using kudu::cluster_summary::TabletSummary;
 
 using std::inserter;
+using std::multimap;
 using std::ostream;
+using std::pair;
 using std::sort;
 using std::string;
 using std::transform;
@@ -139,7 +141,7 @@ bool HasSameContents(const ServersByCountMap& lhs,
 
   auto it_lhs = lhs.begin();
   auto it_rhs = rhs.begin();
-  for (; it_lhs != lhs.end() && it_rhs != rhs.end(); ) {
+  while (it_lhs != lhs.end() && it_rhs != rhs.end()) {
     auto key_lhs = it_lhs->first;
     auto key_rhs = it_rhs->first;
     if (key_lhs != key_rhs) {
@@ -149,26 +151,20 @@ bool HasSameContents(const ServersByCountMap& lhs,
     auto eq_range_lhs = lhs.equal_range(key_lhs);
     auto eq_range_rhs = rhs.equal_range(key_rhs);
 
-    vector<string> lhs_values;
-    {
-      transform(eq_range_lhs.first, eq_range_lhs.second,
-                inserter(lhs_values, lhs_values.begin()),
+    auto getValues = [](pair<ServersByCountMap::const_iterator,
+                             ServersByCountMap::const_iterator> range) {
+      vector<string> values;
+      transform(range.first, range.second,
+                inserter(values, values.begin()),
                 [](const ServersByCountMap::value_type& elem) {
                   return elem.second;
                 });
-      sort(lhs_values.begin(), lhs_values.end());
-    }
+      sort(values.begin(), values.end());
+      return values;
+    };
 
-    vector<string> rhs_values;
-    {
-      transform(eq_range_rhs.first, eq_range_rhs.second,
-                inserter(rhs_values, rhs_values.begin()),
-                [](const ServersByCountMap::value_type& elem) {
-                  return elem.second;
-                });
-      sort(rhs_values.begin(), rhs_values.end());
-    }
-
+    vector<string> lhs_values = getValues(eq_range_lhs);
+    vector<string> rhs_values = getValues(eq_range_rhs);
     if (lhs_values != rhs_values) {
       return false;
     }
@@ -184,13 +180,62 @@ bool HasSameContents(const ServersByCountMap& lhs,
 } // anonymous namespace
 
 bool operator==(const TableBalanceInfo& lhs, const TableBalanceInfo& rhs) {
-  return HasSameContents(lhs.servers_by_replica_count,
-                         rhs.servers_by_replica_count);
+  return
+    lhs.table_id == rhs.table_id &&
+    HasSameContents(lhs.servers_by_replica_count,
+                    rhs.servers_by_replica_count);
+}
+
+bool HasSameContents(const multimap<int32_t, TableBalanceInfo>& lhs,
+                     const multimap<int32_t, TableBalanceInfo>& rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+
+  auto it_lhs = lhs.begin();
+  auto it_rhs = rhs.begin();
+  while (it_lhs != lhs.end() && it_rhs != rhs.end()) {
+    auto key_lhs = it_lhs->first;
+    auto key_rhs = it_rhs->first;
+    if (key_lhs != key_rhs) {
+      return false;
+    }
+
+    auto eq_range_lhs = lhs.equal_range(key_lhs);
+    auto eq_range_rhs = rhs.equal_range(key_rhs);
+
+    auto getValues = [](pair<multimap<int32_t, TableBalanceInfo>::const_iterator,
+                             multimap<int32_t, TableBalanceInfo>::const_iterator> range) {
+      vector<TableBalanceInfo> values;
+      transform(range.first, range.second,
+                inserter(values, values.begin()),
+                [](const multimap<int32_t, TableBalanceInfo>::value_type& elem) {
+                  return elem.second;
+                });
+      sort(values.begin(), values.end(),
+           [](const TableBalanceInfo& lhs, const TableBalanceInfo& rhs) {
+             return lhs.table_id < rhs.table_id;
+           });
+      return values;
+    };
+
+    vector<TableBalanceInfo> lhs_values = getValues(eq_range_lhs);
+    vector<TableBalanceInfo> rhs_values = getValues(eq_range_rhs);
+    if (lhs_values != rhs_values) {
+      return false;
+    }
+
+    // Advance the iterators to continue with next key.
+    it_lhs = eq_range_lhs.second;
+    it_rhs = eq_range_rhs.second;
+  }
+
+  return true;
 }
 
 bool operator==(const ClusterBalanceInfo& lhs, const ClusterBalanceInfo& rhs) {
   return
-      lhs.table_info_by_skew == rhs.table_info_by_skew &&
+      HasSameContents(lhs.table_info_by_skew, rhs.table_info_by_skew) &&
       HasSameContents(lhs.servers_by_total_replica_count,
                       rhs.servers_by_total_replica_count);
 }
@@ -236,6 +281,7 @@ class KsckResultsToClusterBalanceInfoTest : public ::testing::Test {
 // of RF=1 replicas is allowed.
 TEST_F(KsckResultsToClusterBalanceInfoTest, MoveRf1Replicas) {
   const Rebalancer::Config rebalancer_config = {
+    {},     // blacklist_tservers
     {},     // ignored_tservers
     {},     // master_addresses
     {},     // table_filters
@@ -373,6 +419,7 @@ TEST_F(KsckResultsToClusterBalanceInfoTest, MoveRf1Replicas) {
 // RF=1 replicas is disabled.
 TEST_F(KsckResultsToClusterBalanceInfoTest, DoNotMoveRf1Replicas) {
   const Rebalancer::Config rebalancer_config = {
+    {},     // blacklist_tservers
     {},     // ignored_tservers
     {},     // master_addresses
     {},     // table_filters
@@ -400,7 +447,7 @@ TEST_F(KsckResultsToClusterBalanceInfoTest, DoNotMoveRf1Replicas) {
         { { 0, "ts_0" }, }
       }
     },
-    // Two tserver, two tables, RF=1.
+    // Two tservers, two tables, RF=1.
     {
       {
         { { "ts_0" }, { "ts_1" }, },

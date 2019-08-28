@@ -65,6 +65,14 @@ struct TestClusterConfig;
     } \
   } while (false)
 
+#define VERIFY_MOVES_FROM_BLACKLIST_TSERVERS(test_config) \
+  do { \
+    for (auto idx = 0; idx < ARRAYSIZE((test_config)); ++idx) { \
+      SCOPED_TRACE(Substitute("test config index: $0", idx)); \
+      NO_FATALS(VerifyMovesFromBlacklistTservers((test_config)[idx])); \
+    } \
+  } while (false)
+
 using std::endl;
 using std::ostream;
 using std::ostringstream;
@@ -127,6 +135,9 @@ struct TestClusterConfig {
 
   // Options controlling how the reference and the actual results are compared.
   const ReferenceComparisonOptions ref_comparison_options;
+
+  // UUIDs of blacklist tservers.
+  const vector<string> blacklist_tservers;
 };
 
 bool operator==(const TableReplicaMove& lhs, const TableReplicaMove& rhs) {
@@ -200,6 +211,25 @@ void ClusterConfigToClusterInfo(const TestClusterConfig& tcc,
     }
   }
 
+  auto& blacklist_tservers_info = result.blacklist_tservers;
+  for (const auto& blacklist_tserver : tcc.blacklist_tservers) {
+    auto& replica_count_by_table = LookupOrEmplace(&blacklist_tservers_info,
+                                                   blacklist_tserver,
+                                                   unordered_map<string, int32_t>());
+    for (const auto& table_info : tcc.table_replicas) {
+      auto& replica_count = LookupOrEmplace(&replica_count_by_table, table_info.table_id, 0);
+      int idx = -1;
+      for (size_t tserver_idx = 0; tserver_idx < tcc.tserver_uuids.size(); ++tserver_idx) {
+        if (tcc.tserver_uuids[tserver_idx] == blacklist_tserver) {
+          idx = tserver_idx;
+          break;
+        }
+      }
+      CHECK_GE(idx, 0);
+      replica_count += table_info.num_replicas_by_server[idx];
+    }
+  }
+
   *cluster_info = std::move(result);
 }
 
@@ -260,6 +290,82 @@ void VerifyLocationRebalancingMoves(const TestClusterConfig& cfg) {
   }
 }
 
+bool NoBlacklistTserversInClusterInfo(const ClusterInfo& cluster_info) {
+  const auto& blacklist_tservers = cluster_info.blacklist_tservers;
+  if (blacklist_tservers.empty()) {
+    return true;
+  }
+
+  // No blacklist tservers in ClusterBalanceInfo.
+  const auto& servers_by_total_replica_count = cluster_info.balance.servers_by_total_replica_count;
+  for (const auto& elem : servers_by_total_replica_count) {
+    if (ContainsKey(blacklist_tservers, elem.second)) {
+      return false;
+    }
+  }
+  const auto& table_info_by_skew = cluster_info.balance.table_info_by_skew;
+  for (const auto& elem : table_info_by_skew) {
+    const auto& servers_by_table_replica_count = elem.second.servers_by_replica_count;
+    for (const auto& e : servers_by_table_replica_count) {
+      if (ContainsKey(blacklist_tservers, e.second)) {
+        return false;
+      }
+    }
+  }
+
+  // No blacklist tservers in ClusterLocalityInfo.
+  const auto& locality_info = cluster_info.locality;
+  for (const auto& elem: blacklist_tservers) {
+    const auto& blacklist_tserver_uuid = elem.first;
+    if (ContainsKey(locality_info.location_by_ts_id, blacklist_tserver_uuid)) {
+      return false;
+    }
+    for (const auto& e : locality_info.servers_by_location) {
+      if (ContainsKey(e.second, blacklist_tserver_uuid)) {
+        return false;
+      }
+      if (e.second.empty()) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+void VerifyMovesFromBlacklistTservers(const TestClusterConfig& cfg) {
+  vector<TableReplicaMove> moves;
+  {
+    ClusterInfo ci;
+    ClusterConfigToClusterInfo(cfg, &ci);
+    if (cfg.servers_by_location.empty()) {
+      TwoDimensionalGreedyAlgo algo(
+        TwoDimensionalGreedyAlgo::EqualSkewOption::PICK_FIRST);
+      ASSERT_OK(algo.MoveReplicasFromTservers(&ci, 0, &moves));
+    } else {
+      LocationBalancingAlgo algo(1.0, LocationBalancingAlgo::EqualSkewOption::PICK_FIRST);
+      ASSERT_OK(algo.MoveReplicasFromTservers(&ci, 0, &moves));
+    }
+    EXPECT_TRUE(NoBlacklistTserversInClusterInfo(ci));
+  }
+
+  const auto kMovesComparator = [](const TableReplicaMove& lhs,
+                                   const TableReplicaMove& rhs) {
+    if (lhs.table_id != rhs.table_id) {
+      return lhs.table_id < rhs.table_id;
+    }
+    if (lhs.from != rhs.from) {
+      return lhs.from < rhs.from;
+    }
+    return lhs.to < rhs.to;
+  };
+  vector<TableReplicaMove> ref_moves(cfg.expected_moves);
+  sort(ref_moves.begin(), ref_moves.end(), kMovesComparator);
+  sort(moves.begin(), moves.end(), kMovesComparator);
+  EXPECT_EQ(ref_moves, moves);
+}
+
+
 // Is 'cbi' balanced according to the two-dimensional greedy algorithm?
 bool IsBalanced(const ClusterBalanceInfo& cbi) {
   if (cbi.table_info_by_skew.empty()) {
@@ -297,6 +403,13 @@ TEST(RebalanceAlgoUnitTest, EmptyClusterInfoGetNextMoves) {
   EXPECT_TRUE(moves.empty());
 }
 
+TEST(RebalanceAlgoUnitTest, EmptyClusterBalanceInfoMoveReplicasFromTservers) {
+  vector<TableReplicaMove> moves;
+  ClusterInfo info = {};
+  ASSERT_OK(TwoDimensionalGreedyAlgo().MoveReplicasFromTservers(&info, 0, &moves));
+  EXPECT_TRUE(moves.empty());
+}
+
 // Test the behavior of the algorithm when no tablet skew information
 // is provided in the ClusterBalanceInfo structure.
 TEST(RebalanceAlgoUnitTest, NoTableSkewInClusterBalanceInfoGetNextMoves) {
@@ -318,6 +431,25 @@ TEST(RebalanceAlgoUnitTest, NoTableSkewInClusterBalanceInfoGetNextMoves) {
   }
 }
 
+TEST(RebalanceAlgoUnitTest, NoTableSkewInClusterBalanceInfoMoveReplicasFromTservers) {
+  {
+    vector<TableReplicaMove> moves;
+    ClusterInfo info = { { {}, { { 0, "ts_0" } } } };
+    ASSERT_OK(TwoDimensionalGreedyAlgo().MoveReplicasFromTservers(&info, 0, &moves));
+    EXPECT_TRUE(moves.empty());
+  }
+
+  {
+    vector<TableReplicaMove> moves;
+    ClusterInfo info = { { {}, { { 1, "ts_0" }, } } };
+    const auto s = TwoDimensionalGreedyAlgo().MoveReplicasFromTservers(&info, 0, &moves);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_MATCHES(s.ToString(),
+        "non-zero table count .* on tablet server .* while no table "
+        "skew information in ClusterBalanceInfo");
+  }
+}
+
 // Test the behavior of the internal (non-public) algorithm's method
 // GetNextMove() when no input information is given.
 TEST(RebalanceAlgoUnitTest, EmptyBalanceInfoGetNextMove) {
@@ -326,6 +458,17 @@ TEST(RebalanceAlgoUnitTest, EmptyBalanceInfoGetNextMove) {
   const auto s = TwoDimensionalGreedyAlgo().GetNextMove(info, &move);
   ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
   EXPECT_EQ(boost::none, move);
+}
+
+// Test the behavior of the internal (non-public) algorithm's method
+// GetMoveToServer() when no input information is given.
+TEST(RebalanceAlgoUnitTest, EmptyClusterInfoGetMoveToServer) {
+  const std::string table_id;
+  const ClusterInfo info = {};
+  std::string dst_server_uuid;
+  const auto s = TwoDimensionalGreedyAlgo().GetMoveToServer(info, table_id, &dst_server_uuid);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  EXPECT_EQ("",dst_server_uuid);
 }
 
 // Workaround for older libstdc++ (like on RH/CentOS 6). In case of newer
@@ -1113,6 +1256,72 @@ TEST(RebalanceAlgoUnitTest, LocationBalancingSimpleMT) {
     },
   };
   VERIFY_LOCATION_BALANCING_MOVES(kConfigs);
+}
+
+// Set of scenarios where all tablets at blacklist tservers should be moved to other servers.
+TEST(RebalanceAlgoUnitTest, MovesFromBlacklistTservers) {
+  const TestClusterConfig kConfigs[] = {
+    {
+      // No tablet at blacklist tserver.
+      kNoLocations,
+      { "0", "1", "2", },
+      {
+        { "A", { 2, 0, 1} },
+        { "B", { 2, 0, 1} },
+      },
+      {},    // no expected_moves.
+      {},
+      { "1", },   // blacklist_tservers
+    },
+    {
+      // Balanced state, single table.
+      kNoLocations,
+      { "0", "1", "2", },
+      {
+        { "A", { 1, 1, 1} },
+      },
+      {
+        { "A", "1", "0" },
+      },
+      {},
+      { "1", }
+    },
+    {
+      // Few moves.
+      kNoLocations,
+      { "0", "1", "2", },
+      {
+        { "A", { 2, 0, 1, } },
+        { "B", { 0, 2, 1, } },
+      },
+      {
+        { "A", "2", "1" },
+        { "B", "2", "0" },
+      },
+      {},
+      { "2", }   // blacklist_tservers
+    },
+    {
+      // Multiple locations.
+      {
+        { "L0", { "0", "1", }, },
+        { "L1", { "2", }, },
+      },
+      { "0", "1", "2", },
+      {
+        { "A", { 1, 2, 0, } },
+        { "B", { 2, 1, 0, } },
+      },
+      {
+        { "A", "1", "2" },
+        { "A", "1", "2" },
+        { "B", "1", "2" },
+      },
+      {},
+      { "1", }
+    },
+  };
+  VERIFY_MOVES_FROM_BLACKLIST_TSERVERS(kConfigs);
 }
 
 } // namespace rebalance

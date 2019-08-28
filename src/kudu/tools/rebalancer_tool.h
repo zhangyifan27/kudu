@@ -302,6 +302,10 @@ class RebalancerTool : public rebalance::Rebalancer {
       const KsckResults& ksck_info,
       rebalance::ClusterRawInfo* raw_info);
 
+  // Print information on blacklist tservers.
+  Status PrintBlacklistTserversStats(const rebalance::ClusterInfo& ci,
+                                     std::ostream& out) const;
+
   // Print information on the cross-location balance.
   Status PrintCrossLocationBalanceStats(const rebalance::ClusterInfo& ci,
                                         std::ostream& out) const;
@@ -316,6 +320,10 @@ class RebalancerTool : public rebalance::Rebalancer {
 
   Status PrintPolicyViolationInfo(const rebalance::ClusterRawInfo& raw_info,
                                   std::ostream& out) const;
+
+    // Check whether it is safe to remove blacklist tservers from cluster.
+  Status CheckRemovingTserversIsSafe(const rebalance::ClusterRawInfo& raw_info,
+                                     const rebalance::ClusterInfo& info) const;
 
   // Run rebalancing using the specified runner.
   Status RunWith(Runner* runner, RunStatus* result_status);

@@ -45,6 +45,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
@@ -233,6 +234,49 @@ TEST_P(RebalanceStartCriteriaTest, TabletServerIsDown) {
         << "stderr: " << err;
   }
 }
+
+// Make sure the rebalancer doesn't start if specified too many blacklist tservers.
+class RebalanceStartSecurityTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<Kudu1097> {
+};
+INSTANTIATE_TEST_CASE_P(, RebalanceStartSecurityTest,
+                        ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
+TEST_P(RebalanceStartSecurityTest, TooManyBlacklistTservers) {
+  const bool is_343_scheme = (GetParam() == Kudu1097::Enable);
+  const vector<string> kMasterFlags = {
+    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
+  };
+  const vector<string> kTserverFlags = {
+    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
+  };
+
+  FLAGS_num_tablet_servers = 5;
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+
+  // Assign 3 blacklist tservers.
+  vector<string> blacklist_tservers;
+  for (int i = 0; i < 3; i++) {
+    auto* ts = cluster_->tablet_server(i);
+    ASSERT_NE(nullptr, ts);
+    blacklist_tservers.emplace_back(ts->uuid());
+  }
+
+  string out;
+  string err;
+  Status s = RunKuduTool({
+    "cluster",
+    "rebalance",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    "--blacklist_tservers=" +
+    JoinStrings(blacklist_tservers, ",")
+  }, &out, &err);
+  ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
+  const auto err_msg_pattern =
+      "The number of blacklist tservers cannot exceed the threshold 2";
+  ASSERT_STR_MATCHES(err, err_msg_pattern);
+}
+
 
 static Status CreateTables(
     cluster::ExternalMiniCluster* cluster,

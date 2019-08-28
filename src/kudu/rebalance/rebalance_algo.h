@@ -80,10 +80,16 @@ struct ClusterLocalityInfo {
   std::unordered_map<std::string, std::string> location_by_ts_id;
 };
 
+// Mapping table id --> replica count.
+typedef std::unordered_map<std::string, int32_t> ReplicaCountByTable;
+
 // Information on a cluster as input for various rebalancing algorithms.
 struct ClusterInfo {
   ClusterBalanceInfo balance;
   ClusterLocalityInfo locality;
+
+  // Mapping ts_uuid --> replica count by table
+  std::unordered_map<std::string, ReplicaCountByTable> blacklist_tservers;
 };
 
 // A directive to move some replica of a table between two tablet servers.
@@ -114,7 +120,32 @@ class RebalancingAlgo {
   virtual Status GetNextMoves(const ClusterInfo& cluster_info,
                               int max_moves_num,
                               std::vector<TableReplicaMove>* moves);
+
+  // The top-level method of moving replicas from blacklist tservers algorithm.
+  // Using information on the current state of the cluster in 'cluster_info',
+  // the algorithm gets particular replica movements instructions and populates
+  // the output parameter 'moves' that aim to move all replicas on blacklist
+  // tservers to other servers. Replica moves from one tablet server would be no
+  // more than 'max_moves_per_server', 'max_moves_per_server' must be non-negative
+  // value, where value of '0' is a shortcut for 'the possible maximum'.
+  //
+  // Once this method returns Status::OK(), tablet servers in blacklist would be
+  // removed from 'cluster_info' so that no replica would be moved to these servers.
+  //
+  // 'moves' must be non-NULL.
+  virtual Status MoveReplicasFromTservers(ClusterInfo* cluster_info,
+                                          int max_moves_per_server,
+                                          std::vector<TableReplicaMove>* moves);
  protected:
+  // Get the destination tserver for the replica of table_id on
+  // any blacklist tserver. The algorithm would always find a suitable
+  // tserver for the replica to move to theoretically.
+  //
+  // 'dst_server_uuid' must be non-NULL.
+  virtual Status GetMoveToServer(const ClusterInfo& cluster_info,
+                                 const std::string& table_id,
+                                 std::string* dst_server_uuid) = 0;
+
   // Get the next rebalancing move from the algorithm. If there is no such move,
   // the 'move' output parameter is set to 'boost::none'.
   //
@@ -147,6 +178,10 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
       EqualSkewOption opt = EqualSkewOption::PICK_RANDOM);
 
  protected:
+  Status GetMoveToServer(const ClusterInfo& cluster_info,
+                         const std::string& table_id,
+                         std::string* dst_server_uuid) override;
+
   Status GetNextMove(const ClusterInfo& cluster_info,
                      boost::optional<TableReplicaMove>* move) override;
 
@@ -156,6 +191,7 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
   FRIEND_TEST(RebalanceAlgoUnitTest, RandomizedTest);
   FRIEND_TEST(RebalanceAlgoUnitTest, EmptyBalanceInfoGetNextMove);
   FRIEND_TEST(RebalanceAlgoUnitTest, EmptyClusterInfoGetNextMove);
+  FRIEND_TEST(RebalanceAlgoUnitTest, EmptyClusterInfoGetMoveToServer);
 
   // Compute the intersection of the least or most loaded tablet servers for a
   // table with the least or most loaded tablet servers in the cluster:
@@ -255,22 +291,53 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
 // 2 movements gives us the 'ideal' location-wise replica placement.
 class LocationBalancingAlgo : public RebalancingAlgo {
  public:
-  explicit LocationBalancingAlgo(double load_imbalance_threshold);
+  enum class EqualSkewOption {
+    PICK_FIRST,
+    PICK_RANDOM,
+  };
+  explicit LocationBalancingAlgo(
+      double load_imbalance_threshold,
+      EqualSkewOption opt = EqualSkewOption::PICK_RANDOM);
 
  protected:
+  Status GetMoveToServer(const ClusterInfo& cluster_info,
+                         const std::string& table_id,
+                         std::string* dst_server_uuid) override;
+
   Status GetNextMove(const ClusterInfo& cluster_info,
                      boost::optional<TableReplicaMove>* move) override;
  private:
+  enum class ExtremumType { MAX, MIN, };
   FRIEND_TEST(RebalanceAlgoUnitTest, RandomizedTest);
-  typedef std::multimap<double, std::string> TableByLoadImbalance;
+
+  struct TableLocationInfo {
+    std::string table_id;
+    // Mapping location_load --> location
+    std::multimap<double, std::string> location_load_info;
+  };
+  // Mapping table_imbalance_by_loc --> table_location_info
+  typedef std::multimap<double, TableLocationInfo> TableInfoByImbalance;
+
+  // Get per-table information on locations load.
+  Status GetTableImbalanceInfo(const ClusterInfo& cluster_info,
+                               TableInfoByImbalance* table_info_by_imbalance) const;
 
   // Check if any rebalancing is needed across cluster locations based on the
   // information provided by the 'imbalance_info' parameter. Returns 'true'
   // if rebalancing is needed, 'false' otherwise. Upon returning 'true',
   // the identifier of the most cross-location imbalanced table is output into
   // the 'most_imbalanced_table_id' parameter (which must not be null).
-  bool IsBalancingNeeded(const TableByLoadImbalance& imbalance_info,
+  bool IsBalancingNeeded(const TableInfoByImbalance& imbalance_info,
                          std::string* most_imbalanced_table_id) const;
+
+  // Get TableInfoByImbalance of specific table
+  Status GetTableLocationInfo(const TableInfoByImbalance& table_info_by_imbalance,
+                              const std::string& table_id,
+                              TableLocationInfo* table_location_info) const;
+
+  Status GetMinMaxLoadedLocations(const TableLocationInfo& table_locations,
+                                  ExtremumType extremum,
+                                  std::vector<std::string>* locations);
 
   // Given the set of the most and the least table-wise loaded locations, choose
   // the source and destination tablet server to move a replica of the specified
@@ -284,6 +351,9 @@ class LocationBalancingAlgo : public RebalancingAlgo {
       boost::optional<TableReplicaMove>* move);
 
   const double load_imbalance_threshold_;
+  const EqualSkewOption equal_skew_opt_;
+  std::random_device random_device_;
+  std::mt19937 generator_;
 };
 
 } // namespace rebalance

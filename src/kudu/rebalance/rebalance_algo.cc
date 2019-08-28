@@ -87,14 +87,14 @@ Status MoveOneReplica(const string& src,
       // Preserving the original data in the container.
       m->emplace(count_dst, dst);
     }
-    return Status::NotFound("no per-server counts for replica", src);
+    return Status::NotFound("no per-server counts for server $0", src);
   }
   if (!found_dst) {
     if (found_src) {
       // Preserving the original data in the container.
       m->emplace(count_src, src);
     }
-    return Status::NotFound("no per-server counts for replica", dst);
+    return Status::NotFound("no per-server counts for server $0", dst);
   }
 
   // Moving replica from 'src' to 'dst', updating the counter correspondingly.
@@ -102,7 +102,128 @@ Status MoveOneReplica(const string& src,
   m->emplace(count_dst + 1, dst);
   return Status::OK();
 }
+
+// Remove blacklist tservers so that replicas will not move to these servers.
+Status RemoveBlacklistTservers(
+    const std::unordered_map<std::string, ReplicaCountByTable>& blacklist_tservers,
+    ServersByCountMap* m) {
+  for (auto it = m->begin(); it != m->end(); ) {
+    if (!ContainsKey(blacklist_tservers, it->second)) {
+      ++it;
+      continue;
+    }
+    if (it->first != 0) {
+      VLOG(1) << Substitute(
+          "There are still $0 unremoved replicas on the blacklist server: $1",
+          it->first, it->second);
+    }
+    // Remove the blacklist tserver if no replica on it.
+    it = m->erase(it);
+  }
+  return Status::OK();
+}
 } // anonymous namespace
+
+Status RebalancingAlgo::MoveReplicasFromTservers(ClusterInfo* cluster_info,
+                                                 int max_moves_per_server,
+                                                 std::vector<TableReplicaMove>* moves) {
+  DCHECK_LE(0, max_moves_per_server);
+  DCHECK(moves);
+
+  // Value of '0' is a shortcut for 'the possible maximum'.
+  if (max_moves_per_server == 0) {
+    max_moves_per_server = numeric_limits<decltype(max_moves_per_server)>::max();
+  }
+  moves->clear();
+
+  // Copy cluster_info so we can apply moves to the copy.
+  ClusterInfo info(*DCHECK_NOTNULL(cluster_info));
+
+  auto& balance_info = info.balance;
+  if (balance_info.table_info_by_skew.empty()) {
+    // Check for the consistency of the 'cluster_info' parameter: if no
+    // information is given on the table skew, table count for all the tablet
+    // servers should be 0.
+    for (const auto& elem : balance_info.servers_by_total_replica_count) {
+      if (elem.first != 0) {
+        return Status::InvalidArgument(Substitute(
+            "non-zero table count ($0) on tablet server ($1) while no table "
+            "skew information in ClusterBalanceInfo", elem.first, elem.second));
+      }
+    }
+    // Nothing to balance: cluster is empty. Leave 'moves' empty and return.
+    return Status::OK();
+  }
+  if (balance_info.servers_by_total_replica_count.empty()) {
+    return Status::InvalidArgument("no per-server replica count information");
+  }
+
+  // Move all replicas on blacklist tservers.
+  const auto& blacklist_tservers_info = info.blacklist_tservers;
+  if (blacklist_tservers_info.empty()) {
+    // No tablet server is in blacklist.
+    return Status::OK();
+  }
+  for (const auto& elem : blacklist_tservers_info) {
+    int moves_num = 0;
+    const auto& ts_uuid = elem.first;
+    const auto& replica_count_by_table = elem.second;
+    for (const auto& e : replica_count_by_table) {
+      const auto& table_id = e.first;
+      auto replica_count = e.second;
+      VLOG(1) << Substitute("Move $0 replicas of table $1 from blacklist tserver $2",
+                            replica_count, table_id, ts_uuid);
+      while (replica_count > 0 && moves_num < max_moves_per_server) {
+        std::string dst_server_uuid;
+        RETURN_NOT_OK(GetMoveToServer(info, table_id, &dst_server_uuid));
+        if (dst_server_uuid.empty()) {
+          return Status::IllegalState(Substitute(
+              "Could not find any suitable destination server."));
+        }
+        TableReplicaMove move = { table_id, ts_uuid, dst_server_uuid };
+        RETURN_NOT_OK(ApplyMove(move, &balance_info));
+        moves->push_back(std::move(move));
+        moves_num++;
+        replica_count--;
+      }
+      if (moves_num >= max_moves_per_server) {
+        break;
+      }
+    }
+  }
+
+  // Remove blacklist tservers from ClusterBalanceInfo.
+  RETURN_NOT_OK(RemoveBlacklistTservers(blacklist_tservers_info,
+                                        &balance_info.servers_by_total_replica_count));
+  std::multimap<int32_t, TableBalanceInfo> table_balance_info_by_skew;
+  for (const auto& elem: balance_info.table_info_by_skew) {
+    TableBalanceInfo table_balance_info = elem.second;
+    RETURN_NOT_OK(RemoveBlacklistTservers(blacklist_tservers_info,
+                                          &table_balance_info.servers_by_replica_count));
+    int32_t skew = table_balance_info.servers_by_replica_count.rbegin()->first -
+                   table_balance_info.servers_by_replica_count.begin()->first;
+    table_balance_info_by_skew.emplace(skew, table_balance_info);
+  }
+  std::swap(balance_info.table_info_by_skew, table_balance_info_by_skew);
+
+  // Remove blacklist tservers from ClusterLocalityInfo.
+  for (const auto& elem : blacklist_tservers_info) {
+    const auto& blacklist_tserver = elem.first;
+    info.locality.location_by_ts_id.erase(blacklist_tserver);
+    for (auto it = info.locality.servers_by_location.begin();
+         it != info.locality.servers_by_location.end();) {
+      it->second.erase(blacklist_tserver);
+      if (it->second.empty()) {
+        it = info.locality.servers_by_location.erase(it);
+        continue;
+      }
+      ++it;
+    }
+  }
+
+  std::swap(*cluster_info, info);
+  return Status::OK();
+}
 
 Status RebalancingAlgo::GetNextMoves(const ClusterInfo& cluster_info,
                                      int max_moves_num,
@@ -113,8 +234,9 @@ Status RebalancingAlgo::GetNextMoves(const ClusterInfo& cluster_info,
   // Value of '0' is a shortcut for 'the possible maximum'.
   if (max_moves_num == 0) {
     max_moves_num = numeric_limits<decltype(max_moves_num)>::max();
+  } else {
+    max_moves_num -= static_cast<int>(moves->size());
   }
-  moves->clear();
 
   const auto& balance = cluster_info.balance;
   if (balance.table_info_by_skew.empty()) {
@@ -155,7 +277,7 @@ Status RebalancingAlgo::ApplyMove(const TableReplicaMove& move,
   // Update the total counts.
   RETURN_NOT_OK_PREPEND(
       MoveOneReplica(move.from, move.to, &info.servers_by_total_replica_count),
-      Substitute("missing information on table $0", move.table_id));
+      Substitute("missing information on server $0 $1", move.from, move.to));
 
   // Find the balance info for the table.
   auto& table_info_by_skew = info.table_info_by_skew;
@@ -196,6 +318,96 @@ Status RebalancingAlgo::ApplyMove(const TableReplicaMove& move,
 TwoDimensionalGreedyAlgo::TwoDimensionalGreedyAlgo(EqualSkewOption opt)
     : equal_skew_opt_(opt),
       generator_(random_device_()) {
+}
+
+Status TwoDimensionalGreedyAlgo::GetMoveToServer(const ClusterInfo& cluster_info,
+                                                 const std::string& table_id,
+                                                 std::string* dst_server_uuid) {
+  DCHECK(dst_server_uuid);
+  const auto& balance_info = cluster_info.balance;
+  const auto& table_info_by_skew = balance_info.table_info_by_skew;
+  if (table_info_by_skew.empty()) {
+    return Status::InvalidArgument("no table balance information");
+  }
+  if (balance_info.servers_by_total_replica_count.empty()) {
+    return Status::InvalidArgument("no per-server replica count information");
+  }
+  if (table_id.empty()) {
+    return Status::InvalidArgument("no table information");
+  }
+
+  // Get TableBalanceInfo of certain table_id.
+  TableBalanceInfo table_balance_info;
+  bool found_table_info = false;
+  for (const auto& elem : table_info_by_skew) {
+    if (elem.second.table_id == table_id) {
+      table_balance_info = elem.second;
+      found_table_info = true;
+      break;
+    }
+  }
+  if (!found_table_info) {
+    return Status::NotFound(Substitute("missing table info for table $0", table_id));
+  }
+
+  auto servers_by_table_replica_count = table_balance_info.servers_by_replica_count;
+  auto servers_by_total_replica_count = balance_info.servers_by_total_replica_count;
+  const auto& blacklist_tservers = cluster_info.blacklist_tservers;
+
+  // Lambda for removing blacklist tservers from ServersByCountMap.
+  const auto remove_blacklist_tservers = [&blacklist_tservers](ServersByCountMap* servers) {
+    for (auto it = servers->begin(); it != servers->end();) {
+      if (ContainsKey(blacklist_tservers, it->second)) {
+        it = servers->erase(it);
+        continue;
+      }
+      ++it;
+    }
+  };
+
+  // Lambda for finding least loaded servers.
+  const auto find_min_loaded_servers = [](const ServersByCountMap& servers,
+                                          vector<string>* server_uuids) {
+    int32_t min_loaded_replica_count = servers.begin()->first;
+    const auto range = servers.equal_range(min_loaded_replica_count);
+    std::transform(range.first, range.second, back_inserter(*server_uuids),
+                   [](const ServersByCountMap::value_type& elem) {
+                     return elem.second;
+                   });
+  };
+
+  // Candidate set of destination tservers.
+  vector<string> dst_server_uuids;
+  // Choose server that not in blacklist.
+  remove_blacklist_tservers(&servers_by_table_replica_count);
+  remove_blacklist_tservers(&servers_by_total_replica_count);
+
+  if (servers_by_table_replica_count.rbegin()->first -
+      servers_by_table_replica_count.begin()->first > 0) {
+    // If the table is not balance, choose the least loaded tservers in
+    // servers_by_table_replica_count.
+    find_min_loaded_servers(servers_by_table_replica_count, &dst_server_uuids);
+  } else if (servers_by_total_replica_count.rbegin()->first -
+             servers_by_total_replica_count.begin()->first > 0) {
+    // If the table is balance and the cluster is not balance, choose the least
+    // loaded servers in cluster, for the move would improve cluster skew.
+    find_min_loaded_servers(servers_by_total_replica_count, &dst_server_uuids);
+  } else {
+    // If both the table and cluster is balance, choose any tserver not in
+    // blacklist to move to.
+    std::transform(servers_by_table_replica_count.begin(),
+                   servers_by_table_replica_count.end(),
+                   back_inserter(dst_server_uuids),
+                   [](const ServersByCountMap::value_type& elem) {
+                     return elem.second;
+                   });
+  }
+  // Pick a server from dst_server_uuids
+  if (equal_skew_opt_ == EqualSkewOption::PICK_RANDOM) {
+      shuffle(dst_server_uuids.begin(), dst_server_uuids.end(), generator_);
+  }
+  *dst_server_uuid = dst_server_uuids.front();
+  return Status::OK();
 }
 
 Status TwoDimensionalGreedyAlgo::GetNextMove(
@@ -402,8 +614,104 @@ Status TwoDimensionalGreedyAlgo::GetMinMaxLoadedServers(
   return Status::OK();
 }
 
-LocationBalancingAlgo::LocationBalancingAlgo(double load_imbalance_threshold)
-    : load_imbalance_threshold_(load_imbalance_threshold) {
+LocationBalancingAlgo::LocationBalancingAlgo(double load_imbalance_threshold,
+                                             EqualSkewOption opt)
+    : load_imbalance_threshold_(load_imbalance_threshold),
+      equal_skew_opt_(opt),
+      generator_(random_device_()) {
+}
+
+Status LocationBalancingAlgo::GetMoveToServer(const ClusterInfo& cluster_info,
+                                              const std::string& table_id,
+                                              std::string* dst_server_uuid) {
+  DCHECK(dst_server_uuid);
+  const auto& balance_info = cluster_info.balance;
+  const auto& table_info_by_skew = balance_info.table_info_by_skew;
+  if (table_info_by_skew.empty()) {
+    return Status::InvalidArgument("no table balance information");
+  }
+  if (balance_info.servers_by_total_replica_count.empty()) {
+    return Status::InvalidArgument("no per-server replica count information");
+  }
+  if (table_id.empty()) {
+    return Status::InvalidArgument("no table information");
+  }
+
+  // Get TableBalanceInfo of certain table_id.
+  TableBalanceInfo table_balance_info;
+  bool found_table = false;
+  for (const auto& elem : table_info_by_skew) {
+    if (elem.second.table_id == table_id) {
+      table_balance_info = elem.second;
+      found_table = true;
+      break;
+    }
+  }
+  if (!found_table) {
+    return Status::NotFound(Substitute("missing table info for table $0", table_id));
+  }
+
+  const auto& blacklist_tservers = cluster_info.blacklist_tservers;
+
+  // Get TableLocationInfo of certain table_id, blacklist tservers should be excluded.
+  unordered_map<string, int32_t> replica_num_per_location;
+  unordered_map<string, int32_t> server_num_per_location;
+  for (const auto& server_info : table_balance_info.servers_by_replica_count) {
+    const auto& replica_count = server_info.first;
+    const auto& ts_id = server_info.second;
+    if (ContainsKey(blacklist_tservers, ts_id)) {
+      continue;
+    }
+    const auto& location = FindOrDie(cluster_info.locality.location_by_ts_id, ts_id);
+    LookupOrEmplace(&replica_num_per_location, location, 0) += replica_count;
+    LookupOrEmplace(&server_num_per_location, location, 0) += 1;
+  }
+  TableLocationInfo table_location_info;
+  table_location_info.table_id = table_id;
+  auto& location_load_info = table_location_info.location_load_info;
+  for (const auto& elem : replica_num_per_location) {
+    const auto& location = elem.first;
+    auto replica_num = static_cast<double>(elem.second);
+    auto ts_num = FindOrDie(server_num_per_location, location);
+    CHECK_NE(0, ts_num);
+    location_load_info.emplace(replica_num / ts_num, location);
+  }
+
+  vector<string> loc_loaded_least;
+  RETURN_NOT_OK(GetMinMaxLoadedLocations(table_location_info,
+                                         ExtremumType::MIN,
+                                         &loc_loaded_least));
+  DCHECK(!loc_loaded_least.empty());
+
+  std::unordered_map<std::string, int32_t> load_by_ts;
+  for (const auto& elem : balance_info.servers_by_total_replica_count) {
+    EmplaceOrDie(&load_by_ts, elem.second, elem.first);
+  }
+
+  ServersByCountMap servers_in_loaded_least_locations;
+  for (const auto& loc : loc_loaded_least) {
+    auto& servers = FindOrDie(cluster_info.locality.servers_by_location, loc);
+    for (auto& server : servers) {
+      if (ContainsKey(blacklist_tservers, server)) {
+        continue;
+      }
+      servers_in_loaded_least_locations.emplace(FindOrDie(load_by_ts, server), server);
+    }
+  }
+
+  // Choose loaded least server.
+  vector<string> server_uuids;
+  const auto min_loaded_replica_count = servers_in_loaded_least_locations.begin()->first;
+  const auto range = servers_in_loaded_least_locations.equal_range(min_loaded_replica_count);
+  std::transform(range.first, range.second, back_inserter(server_uuids),
+                 [](const ServersByCountMap::value_type& elem) {
+                 return elem.second;
+                });
+  if (equal_skew_opt_ == EqualSkewOption::PICK_RANDOM) {
+    shuffle(server_uuids.begin(), server_uuids.end(), generator_);
+  }
+  *dst_server_uuid = server_uuids.front();
+  return Status::OK();
 }
 
 Status LocationBalancingAlgo::GetNextMove(
@@ -412,70 +720,31 @@ Status LocationBalancingAlgo::GetNextMove(
   DCHECK(move);
   *move = boost::none;
 
-  // Per-table information on locations load.
-  // TODO(aserbin): maybe, move this container into ClusterInfo?
-  unordered_map<string, multimap<double, string>> location_load_info_by_table;
-
-  // A dictionary to map location-wise load imbalance into table identifier.
-  // The most imbalanced tables come last.
-  multimap<double, string> table_id_by_load_imbalance;
-  for (const auto& elem : cluster_info.balance.table_info_by_skew) {
-    const auto& table_info = elem.second;
-    // Number of replicas of all tablets comprising the table, per location.
-    unordered_map<string, int32_t> replica_num_per_location;
-    for (const auto& elem : table_info.servers_by_replica_count) {
-      auto replica_count = elem.first;
-      const auto& ts_id = elem.second;
-      const auto& location =
-          FindOrDie(cluster_info.locality.location_by_ts_id, ts_id);
-      LookupOrEmplace(&replica_num_per_location, location, 0) += replica_count;
-    }
-    multimap<double, string> location_by_load;
-    for (const auto& elem : replica_num_per_location) {
-      const auto& location = elem.first;
-      double replica_num = static_cast<double>(elem.second);
-      auto ts_num = FindOrDie(cluster_info.locality.servers_by_location,
-                              location).size();
-      CHECK_NE(0, ts_num);
-      location_by_load.emplace(replica_num / ts_num, location);
-    }
-
-    const auto& table_id = table_info.table_id;
-    const auto load_min = location_by_load.cbegin()->first;
-    const auto load_max = location_by_load.crbegin()->first;
-    const auto imbalance = load_max - load_min;
-    DCHECK(!std::isnan(imbalance));
-    table_id_by_load_imbalance.emplace(imbalance, table_id);
-    EmplaceOrDie(&location_load_info_by_table,
-                 table_id, std::move(location_by_load));
-  }
+  TableInfoByImbalance table_info_by_imbalance;
+  RETURN_NOT_OK(GetTableImbalanceInfo(cluster_info, &table_info_by_imbalance));
 
   string imbalanced_table_id;
-  if (!IsBalancingNeeded(table_id_by_load_imbalance, &imbalanced_table_id)) {
+  if (!IsBalancingNeeded(table_info_by_imbalance, &imbalanced_table_id)) {
     // Nothing to do: all tables are location-balanced enough.
     return Status::OK();
   }
 
   // Work on the most location-wise unbalanced tables first.
-  const auto& load_info = FindOrDie(
-      location_load_info_by_table, imbalanced_table_id);
+  TableLocationInfo table_location_info;
+  RETURN_NOT_OK(GetTableLocationInfo(table_info_by_imbalance,
+                                     imbalanced_table_id,
+                                     &table_location_info));
 
   vector<string> loc_loaded_least;
-  {
-    const auto min_range = load_info.equal_range(load_info.cbegin()->first);
-    for (auto it = min_range.first; it != min_range.second; ++it) {
-      loc_loaded_least.push_back(it->second);
-    }
-  }
+  RETURN_NOT_OK(GetMinMaxLoadedLocations(table_location_info,
+                                         ExtremumType::MIN,
+                                         &loc_loaded_least));
   DCHECK(!loc_loaded_least.empty());
 
   vector<string> loc_loaded_most;
-  {
-    const auto max_range = load_info.equal_range(load_info.crbegin()->first);
-    for (auto it = max_range.first; it != max_range.second; ++it) {
-      loc_loaded_most.push_back(it->second);
-    }
-  }
+  RETURN_NOT_OK(GetMinMaxLoadedLocations(table_location_info,
+                                         ExtremumType::MAX,
+                                         &loc_loaded_most));
   DCHECK(!loc_loaded_most.empty());
 
   if (PREDICT_FALSE(VLOG_IS_ON(1))) {
@@ -500,14 +769,51 @@ Status LocationBalancingAlgo::GetNextMove(
                       cluster_info, move);
 }
 
+Status LocationBalancingAlgo::GetTableImbalanceInfo(
+    const ClusterInfo& cluster_info,
+    TableInfoByImbalance* table_info_by_imbalance) const {
+  for (const auto& elem : cluster_info.balance.table_info_by_skew) {
+    const auto& table_info = elem.second;
+    // Number of replicas of all tablets comprising the table, per location.
+    unordered_map<string, int32_t> replica_num_per_location;
+    for (const auto& e : table_info.servers_by_replica_count) {
+      const auto& replica_count = e.first;
+      const auto& ts_id = e.second;
+      const auto& location =
+          FindOrDie(cluster_info.locality.location_by_ts_id, ts_id);
+      LookupOrEmplace(&replica_num_per_location, location, 0) += replica_count;
+    }
+    multimap<double, string> location_by_load;
+    for (const auto& e : replica_num_per_location) {
+      const auto& location = e.first;
+      double replica_num = static_cast<double>(e.second);
+      const auto& ts_num = FindOrDie(cluster_info.locality.servers_by_location,
+                                     location).size();
+      CHECK_NE(0, ts_num);
+      location_by_load.emplace(replica_num / ts_num, location);
+    }
+
+    const auto& table_id = table_info.table_id;
+    const auto load_min = location_by_load.cbegin()->first;
+    const auto load_max = location_by_load.crbegin()->first;
+    const auto imbalance = load_max - load_min;
+    DCHECK(!std::isnan(imbalance));
+    TableLocationInfo table_location_info;
+    table_location_info.table_id = table_id;
+    std::swap(table_location_info.location_load_info, location_by_load);
+    table_info_by_imbalance->emplace(imbalance, table_location_info);
+  }
+  return Status::OK();
+}
+
 bool LocationBalancingAlgo::IsBalancingNeeded(
-    const TableByLoadImbalance& imbalance_info,
+    const TableInfoByImbalance& imbalance_info,
     string* most_imbalanced_table_id) const {
   if (PREDICT_FALSE(VLOG_IS_ON(1))) {
     ostringstream ss;
     ss << "Table imbalance report: " << endl;
     for (const auto& elem : imbalance_info) {
-      ss << "  " << elem.second << ": " << elem.first << endl;
+      ss << "  " << elem.second.table_id << ": " << elem.first << endl;
     }
     VLOG(1) << ss.str();
   }
@@ -530,10 +836,52 @@ bool LocationBalancingAlgo::IsBalancingNeeded(
   const auto it = imbalance_info.crbegin();
   const auto imbalance = it->first;
   if (imbalance > load_imbalance_threshold_) {
-    *most_imbalanced_table_id = it->second;
+    *most_imbalanced_table_id = it->second.table_id;
     return true;
   }
   return false;
+}
+
+ Status LocationBalancingAlgo::GetTableLocationInfo(
+    const TableInfoByImbalance& table_info_by_imbalance,
+    const std::string& table_id,
+    TableLocationInfo* table_location_info) const {
+  bool found_load_info = false;
+  for (const auto& elem : table_info_by_imbalance) {
+    TableLocationInfo table_info = elem.second;
+    if (table_info.table_id == table_id) {
+      found_load_info = true;
+      std::swap(*table_location_info, table_info);
+      break;
+    }
+  }
+  if (!found_load_info) {
+    return Status::NotFound("missing location load information for table: $0", table_id);
+  }
+  return Status::OK();
+}
+
+Status LocationBalancingAlgo::GetMinMaxLoadedLocations(
+    const TableLocationInfo& table_locations,
+    ExtremumType extremum,
+    std::vector<std::string>* locations) {
+  DCHECK(extremum == ExtremumType::MIN || extremum == ExtremumType::MAX);
+  DCHECK(locations);
+
+  const auto& location_load_info = table_locations.location_load_info;
+  if (location_load_info.empty()) {
+    return Status::InvalidArgument("no table location information");
+  }
+  const auto count = (extremum == ExtremumType::MIN)
+      ? location_load_info.cbegin()->first
+      : location_load_info.crbegin()->first;
+  const auto range = location_load_info.equal_range(count);
+  std::transform(range.first, range.second, back_inserter(*locations),
+                 [](const ServersByCountMap::value_type& elem) {
+                   return elem.second;
+                 });
+
+  return Status::OK();
 }
 
 // Given the set of the most and the least table-wise loaded locations, choose

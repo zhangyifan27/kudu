@@ -107,6 +107,9 @@ Status RebalancerTool::PrintStats(ostream& out) {
     return Status::OK();
   }
 
+  // Print information about replica count of blacklist tservers.
+  RETURN_NOT_OK(PrintBlacklistTserversStats(ci, out));
+
   if (ts_id_by_location.size() == 1) {
     // That's about printing information about the whole cluster.
     return PrintLocationBalanceStats(ts_id_by_location.begin()->first,
@@ -301,6 +304,30 @@ Status RebalancerTool::KsckResultsToClusterRawInfo(
   raw_info->tserver_summaries = std::move(tserver_summaries);
   raw_info->table_summaries = std::move(table_summaries);
   raw_info->tablet_summaries = std::move(tablet_summaries);
+
+  return Status::OK();
+}
+
+Status RebalancerTool::PrintBlacklistTserversStats(const ClusterInfo& ci,
+                                                   ostream& out) const {
+  const auto& blacklist_tservers = ci.blacklist_tservers;
+  if (blacklist_tservers.empty()) {
+    out << "No tablet server is in blacklist." << endl;
+    return Status::OK();
+  }
+  out << "Blacklist_tservers replica distribution summary:" << endl;
+  DataTable summary({"Server UUID", "Replica Count"});
+  for (const auto& elem: blacklist_tservers) {
+    const auto& server_uuid = elem.first;
+    const auto& replica_count_by_table = elem.second;
+    int32_t replica_count = 0;
+    for (const auto& e : replica_count_by_table) {
+      replica_count += e.second;
+    }
+    summary.AddRow({ server_uuid, to_string(replica_count) });
+  }
+  RETURN_NOT_OK(summary.PrintTo(out));
+  out << endl;
 
   return Status::OK();
 }
@@ -587,6 +614,34 @@ Status RebalancerTool::RefreshKsckResults() {
   cluster->set_table_filters(config_.table_filters);
   ksck_.reset(new Ksck(cluster));
   ignore_result(ksck_->Run());
+  return Status::OK();
+}
+
+Status RebalancerTool::CheckRemovingTserversIsSafe(const ClusterRawInfo& raw_info,
+                                                   const ClusterInfo& info) const {
+  const auto& blacklist_tservers_info = info.blacklist_tservers;
+  if (blacklist_tservers_info.empty()) {
+    return Status::OK();
+  }
+
+  // Check whether replicas on blacklist tservers can be moved.
+  // If move all replicas on blacklist tservers to other servers,
+  // the number of remaining servers should be greater than
+  // the maximum number of replication_factor of tables.
+  const size_t blacklist_tserver_count = blacklist_tservers_info.size();
+  const size_t total_tserver_count =  raw_info.tserver_summaries.size();
+  size_t max_blacklist_tserver_count = total_tserver_count;
+  for (const auto& table_summary : raw_info.table_summaries) {
+    max_blacklist_tserver_count =
+    (max_blacklist_tserver_count > (total_tserver_count - table_summary.replication_factor))
+    ? (total_tserver_count - table_summary.replication_factor)
+    : max_blacklist_tserver_count;
+  }
+  if (blacklist_tserver_count > max_blacklist_tserver_count) {
+    return Status::InvalidArgument(Substitute(
+      "The number of blacklist tservers cannot exceed the threshold $0.",
+      max_blacklist_tserver_count));
+  }
   return Status::OK();
 }
 
@@ -916,6 +971,10 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
   ClusterInfo cluster_info;
   RETURN_NOT_OK(rebalancer_->BuildClusterInfo(
       raw_info, scheduled_moves_, &cluster_info));
+  RETURN_NOT_OK(rebalancer_->CheckRemovingTserversIsSafe(raw_info, cluster_info));
+  RETURN_NOT_OK(algorithm()->MoveReplicasFromTservers(&cluster_info,
+                                                      max_moves_per_server_ * 5,
+                                                      &moves));
   RETURN_NOT_OK(algorithm()->GetNextMoves(cluster_info, max_moves, &moves));
   if (moves.empty()) {
     // No suitable moves were found: the cluster described by the 'cluster_info'
@@ -928,9 +987,43 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
             [](const Rebalancer::MovesInProgress::value_type& elem) {
               return elem.first;
             });
-  for (const auto& move : moves) {
+  bool fix_move = false;
+  for (auto& move : moves) {
     vector<string> tablet_ids;
-    RETURN_NOT_OK(FindReplicas(move, raw_info, &tablet_ids));
+    bool is_healthy_move = true;
+    RETURN_NOT_OK(FindReplicas(move, raw_info, &tablet_ids, &is_healthy_move));
+    if (!is_healthy_move) {
+      LOG(WARNING) << Substitute(
+          "No healthy replica of table $0 on server $1.", move.table_id, move.from);
+      continue;
+    }
+    if (ContainsKey(cluster_info.blacklist_tservers, move.from) && tablet_ids.empty()) {
+      // Some replica(s) at source server could not move to destination server and
+      // source server is in blacklist, it is necessary to find another destination
+      // server for all replicas at blacklist servers should be moved.
+      fix_move = true;
+      while (tablet_ids.empty()) {
+        LOG(WARNING) << Substitute(
+            "table $0: could not find any suitable replica to move from "
+            "blacklist server $1 to server $2, retry to find another destination server",
+            move.table_id, move.from, move.to);
+        vector<string> server_uuids;
+        std::transform(raw_info.tserver_summaries.begin(), raw_info.tserver_summaries.end(),
+                       back_inserter(server_uuids),
+                       [](const ServerHealthSummary& elem) {
+                         return elem.uuid;
+                       });
+        shuffle(server_uuids.begin(), server_uuids.end(), random_generator_);
+        for (const auto& elem : server_uuids) {
+          if (elem != move.to && !ContainsKey(cluster_info.blacklist_tservers, elem)) {
+            LOG(INFO) << Substitute("choose destination server: $0",elem);
+            move.to = elem;
+            break;
+          }
+        }
+        RETURN_NOT_OK(FindReplicas(move, raw_info, &tablet_ids, &is_healthy_move));
+      }
+    }
     if (!loc) {
       // In case of cross-location (a.k.a. inter-location) rebalancing it is
       // necessary to make sure the majority of replicas would not end up
@@ -944,7 +1037,7 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
     std::shuffle(tablet_ids.begin(), tablet_ids.end(), random_generator_);
     string move_tablet_id;
     for (const auto& tablet_id : tablet_ids) {
-      if (tablets_in_move.find(tablet_id) == tablets_in_move.end()) {
+      if (!ContainsKey(tablets_in_move, tablet_id)) {
         // For now, choose the very first tablet that does not have replicas
         // in move. Later on, additional logic might be added to find
         // the best candidate.
@@ -975,6 +1068,10 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
     replica_moves->emplace_back(std::move(move_info));
     // Mark the tablet as 'has a replica in move'.
     tablets_in_move.emplace(move_tablet_id);
+    if (fix_move) {
+      // Some move operation has been fixed， ignore subsequent moves.
+      break;
+    }
   }
 
   return Status::OK();

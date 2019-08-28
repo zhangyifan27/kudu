@@ -53,7 +53,8 @@ class Rebalancer {
     static constexpr double kLoadImbalanceThreshold = 1.0;
 
     // NOLINTNEXTLINE(google-explicit-constructor)
-    Config(std::vector<std::string> ignored_tservers_param = {},
+    Config(std::vector<std::string> blacklist_tservers = {},
+           std::vector<std::string> ignored_tservers_param = {},
            std::vector<std::string> master_addresses = {},
            std::vector<std::string> table_filters = {},
            size_t max_moves_per_server = 5,
@@ -65,6 +66,12 @@ class Rebalancer {
            bool run_cross_location_rebalancing = true,
            bool run_intra_location_rebalancing = true,
            double load_imbalance_threshold = kLoadImbalanceThreshold);
+
+    // UUIDs of blacklist tservers. If empty, the whole cluster will be
+    // rebalanced. If not empty, replicas on blacklist tservers will be
+    // moved to the other tservers first and then rebalancer will run on
+    // tservers not in blakclist.
+    std::vector<std::string> blacklist_tservers;
 
     // UUIDs of ignored servers. If empty, allow to run the
     // rebalancing only when all tablet servers in cluster are healthy.
@@ -192,9 +199,13 @@ class Rebalancer {
   // 'tablet_ids' container and tablet server UUIDs TableReplicaMove::from and
   // TableReplica::to correspondingly. If no suitable tablet replicas are found,
   // 'tablet_ids' will be empty with the result status of Status::OK().
+  //
+  // 'is_healthy_move' indicates whether healthy tablets of a specific table can
+  // be found at a specific server(move.from).
   static Status FindReplicas(const TableReplicaMove& move,
                              const ClusterRawInfo& raw_info,
-                             std::vector<std::string>* tablet_ids);
+                             std::vector<std::string>* tablet_ids,
+                             bool *is_healthy_move);
 
   // Filter move operations in 'replica_moves': remove all operations that would
   // involve moving replicas of tablets which are in 'scheduled_moves'. The
