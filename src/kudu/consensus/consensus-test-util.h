@@ -227,6 +227,10 @@ class DelayablePeerProxy : public TestPeerProxy {
                                            this, kUpdate));
   }
 
+  Status UpdateProxy(const std::shared_ptr<rpc::Messenger>& /*messenger*/) override {
+    return Status::OK();
+  }
+  
   void StartElectionAsync(const RunLeaderElectionRequestPB& /*request*/,
                           RunLeaderElectionResponsePB* /*response*/,
                           rpc::RpcController* /*controller*/,
@@ -294,6 +298,10 @@ class MockedPeerProxy : public TestPeerProxy {
     return RegisterCallbackAndRespond(kRequestVote, callback);
   }
 
+  Status UpdateProxy(const std::shared_ptr<rpc::Messenger>& /*messenger*/) override {
+    return Status::OK();
+  }
+
   void StartElectionAsync(const RunLeaderElectionRequestPB& /*request*/,
                           RunLeaderElectionResponsePB* /*response*/,
                           rpc::RpcController* /*controller*/,
@@ -350,6 +358,10 @@ class NoOpTestPeerProxy : public TestPeerProxy {
       response->mutable_status()->set_last_committed_idx(last_received_.index());
     }
     return RegisterCallbackAndRespond(kUpdate, callback);
+  }
+
+  Status UpdateProxy(const std::shared_ptr<rpc::Messenger>& /*messenger*/) override {
+    return Status::OK();
   }
 
   void StartElectionAsync(const RunLeaderElectionRequestPB& /*request*/,
@@ -479,6 +491,10 @@ class LocalTestPeerProxy : public TestPeerProxy {
     RegisterCallback(kUpdate, callback);
     CHECK_OK(pool_->SubmitFunc(boost::bind(&LocalTestPeerProxy::SendUpdateRequest,
                                            this, request, response)));
+  }
+
+  Status UpdateProxy(const std::shared_ptr<rpc::Messenger>& /*messenger*/) override {
+    return Status::OK();
   }
 
   void StartElectionAsync(const RunLeaderElectionRequestPB& /*request*/,

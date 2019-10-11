@@ -383,7 +383,6 @@ void Peer::ProcessResponse() {
   Status s = raft_pool_token_->SubmitFunc([w_this]() {
     if (auto p = w_this.lock()) {
       p->DoProcessResponse();
-
     }
   });
   if (PREDICT_FALSE(!s.ok())) {
@@ -479,6 +478,24 @@ void Peer::ProcessResponseError(const Status& status) {
                  failed_attempts_,
                  kNumRetriesBetweenLoggingFailedRequest);
   }
+  if (status.IsNetworkError()) {
+    LOG(INFO) << Substitute("Retrying to resolve address for peer $0.", peer_pb_.permanent_uuid());
+    // ResolveAddresses() may block, so we run UpdateProxy on our thread pool
+    // and not on the reactor thread.
+    //
+    // Capture a weak_ptr reference into the submitted functor so that we can
+    // safely handle the functor outliving its peer.
+    weak_ptr<Peer> w_this = shared_from_this();
+    Status s = raft_pool_token_->SubmitFunc([w_this]() {
+      if (auto p = w_this.lock()) {
+        p->proxy_->UpdateProxy(p->messenger_);
+      }
+    });
+    if (PREDICT_FALSE(!s.ok())) {
+      LOG_WITH_PREFIX_UNLOCKED(WARNING) <<
+        Substitute("Unable to update consensus peer proxy for peer $0.", peer_pb_.permanent_uuid());
+    }
+  }
   request_pending_ = false;
 }
 
@@ -511,9 +528,11 @@ Peer::~Peer() {
 }
 
 RpcPeerProxy::RpcPeerProxy(gscoped_ptr<HostPort> hostport,
-                           gscoped_ptr<ConsensusServiceProxy> consensus_proxy)
+                           gscoped_ptr<ConsensusServiceProxy> consensus_proxy,
+                           DnsResolver* dns_resolver)
     : hostport_(std::move(DCHECK_NOTNULL(hostport))),
-      consensus_proxy_(std::move(DCHECK_NOTNULL(consensus_proxy))) {
+      consensus_proxy_(std::move(DCHECK_NOTNULL(consensus_proxy))),
+      dns_resolver_(dns_resolver) {
 }
 
 void RpcPeerProxy::UpdateAsync(const ConsensusRequestPB& request,
@@ -522,6 +541,20 @@ void RpcPeerProxy::UpdateAsync(const ConsensusRequestPB& request,
                                const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
   consensus_proxy_->UpdateConsensusAsync(request, response, controller, callback);
+}
+
+Status RpcPeerProxy::UpdateProxy(const shared_ptr<rpc::Messenger>& messenger) {
+  std::lock_guard<Mutex> l(consensus_proxy_lock_);
+  vector<Sockaddr> addrs;
+  RETURN_NOT_OK(dns_resolver_->ResolveAddresses(*hostport_, &addrs));
+  CHECK(!addrs.empty());
+  if (addrs.size() > 1) {
+    LOG(WARNING) << Substitute(
+        "Peer address '$0' resolves to $1 different addresses. "
+        "Using $2", hostport_->ToString(), addrs.size(), addrs[0].ToString());
+  }
+  consensus_proxy_.reset(new ConsensusServiceProxy(messenger, addrs[0], hostport_->host()));
+  return Status::OK();
 }
 
 void RpcPeerProxy::StartElectionAsync(const RunLeaderElectionRequestPB& request,
@@ -584,7 +617,7 @@ Status RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb,
   gscoped_ptr<ConsensusServiceProxy> new_proxy;
   RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
       *hostport, messenger_, dns_resolver_, &new_proxy));
-  proxy->reset(new RpcPeerProxy(std::move(hostport), std::move(new_proxy)));
+  proxy->reset(new RpcPeerProxy(std::move(hostport), std::move(new_proxy), dns_resolver_));
   return Status::OK();
 }
 

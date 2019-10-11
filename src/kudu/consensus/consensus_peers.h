@@ -211,6 +211,8 @@ class PeerProxy {
                            rpc::RpcController* controller,
                            const rpc::ResponseCallback& callback) = 0;
 
+  virtual Status UpdateProxy(const std::shared_ptr<rpc::Messenger>& messenger) = 0;
+
   // Asks a peer to vote for a candidate.
   virtual void RequestConsensusVoteAsync(const VoteRequestPB& request,
                                          VoteResponsePB* response,
@@ -252,12 +254,15 @@ class PeerProxyFactory {
 class RpcPeerProxy : public PeerProxy {
  public:
   RpcPeerProxy(gscoped_ptr<HostPort> hostport,
-               gscoped_ptr<ConsensusServiceProxy> consensus_proxy);
+               gscoped_ptr<ConsensusServiceProxy> consensus_proxy,
+               DnsResolver* dns_resolver);
 
   void UpdateAsync(const ConsensusRequestPB& request,
                    ConsensusResponsePB* response,
                    rpc::RpcController* controller,
                    const rpc::ResponseCallback& callback) override;
+
+  Status UpdateProxy(const std::shared_ptr<rpc::Messenger>& messenger) override;
 
   void RequestConsensusVoteAsync(const VoteRequestPB& request,
                                  VoteResponsePB* response,
@@ -279,6 +284,10 @@ class RpcPeerProxy : public PeerProxy {
  private:
   gscoped_ptr<HostPort> hostport_;
   gscoped_ptr<ConsensusServiceProxy> consensus_proxy_;
+  DnsResolver* dns_resolver_;
+
+  // Protects 'consensus_proxy_'.
+  Mutex consensus_proxy_lock_;
 };
 
 // PeerProxyFactory implementation that generates RPCPeerProxies
