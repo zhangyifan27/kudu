@@ -292,10 +292,14 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   // Returns true if an "Alter" operation is in-progress
   bool IsAlterInProgress(uint32_t version) const;
 
-  void AddTask(MonitoredTask *task);
-  void RemoveTask(MonitoredTask *task);
+  void AddTask(const std::string& tablet_id, const scoped_refptr<MonitoredTask>& task);
+  void RemoveTask(const std::string& tablet_id, MonitoredTask* task);
   void AbortTasks();
   void WaitTasksCompletion();
+
+  // Returns true if pending_tasks_ contains a task whose description
+  // is the same as task_description.
+  bool ContainsTask(const std::string& tablet_id, const std::string& task_description);
 
   // Allow for showing outstanding tasks in the master UI.
   void GetTaskList(std::vector<scoped_refptr<MonitoredTask> > *tasks);
@@ -365,8 +369,8 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
 
   CowObject<PersistentTableInfo> metadata_;
 
-  // List of pending tasks (e.g. create/alter tablet requests)
-  std::unordered_set<MonitoredTask*> pending_tasks_;
+  // Map of tablet_id to pending tasks (e.g. create/alter tablet requests).
+  std::unordered_multimap<std::string, scoped_refptr<MonitoredTask>> pending_tasks_;
 
   // Map of schema version to the number of tablets that reported that version.
   //

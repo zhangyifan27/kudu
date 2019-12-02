@@ -29,7 +29,6 @@
 #include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/clock/clock.h"
@@ -855,7 +854,7 @@ Status TSTabletManager::BeginReplicaStateTransition(
   Status s = StartTabletStateTransitionUnlocked(tablet_id, reason, deleter);
   if (PREDICT_FALSE(!s.ok())) {
     if (error_code) {
-      *error_code = TabletServerErrorPB::TABLET_NOT_RUNNING;
+      *error_code = TabletServerErrorPB::ALREADY_INPROGRESS;
     }
     return s;
   }
