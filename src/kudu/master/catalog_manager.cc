@@ -5554,9 +5554,12 @@ bool TableInfo::ContainsTask(const string& tablet_id, const string& task_descrip
 }
 
 void TableInfo::GetTaskList(vector<scoped_refptr<MonitoredTask>>* tasks) {
-  shared_lock<rw_spinlock> l(lock_);
-  for (const auto& task : pending_tasks_) {
-    tasks->push_back((task.second));
+  tasks->clear();
+  {
+    shared_lock<rw_spinlock> l(lock_);
+    for (const auto& task : pending_tasks_) {
+      tasks->push_back((task.second));
+    }
   }
 }
 
