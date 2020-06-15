@@ -232,6 +232,10 @@ class MaintenanceOp {
 
   virtual int32_t priority() const = 0;
 
+  // Update the op workload_score. This will be called every scheduling period
+  // (about a few times a second).
+  virtual void UpdateWorkloadScore(double* workload_score) const = 0;
+
  private:
   DISALLOW_COPY_AND_ASSIGN(MaintenanceOp);
 
@@ -325,7 +329,7 @@ class MaintenanceManager : public std::enable_shared_from_this<MaintenanceManage
   // suitable for logging.
   std::pair<MaintenanceOp*, std::string> FindBestOp();
 
-  double PerfImprovement(double perf_improvement, int32_t priority) const;
+  static double PerfImprovement(double perf_improvement, double workload_score, int32_t priority);
 
   void LaunchOp(MaintenanceOp* op);
 

@@ -17,9 +17,9 @@
 
 #include "kudu/tablet/tablet_mm_ops.h"
 
+#include <algorithm>
 #include <mutex>
 #include <ostream>
-#include <utility>
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
@@ -83,6 +83,25 @@ DEFINE_bool(enable_deleted_rowset_gc, true,
     "considered ancient history (see --tablet_history_max_age_sec) are deleted.");
 TAG_FLAG(enable_deleted_rowset_gc, runtime);
 
+DEFINE_double(workload_score_upper_bound, 1.0, "Upper bound for workload score.");
+TAG_FLAG(workload_score_upper_bound, experimental);
+TAG_FLAG(workload_score_upper_bound, runtime);
+
+DEFINE_int32(scans_started_per_sec_for_hot_tablets, 1,
+    "Minimum read rate for tablets considered 'hot' (scans/sec). If a tablet's "
+    "read rate exceed this value, flush/compaction Ops for this tablet would have a "
+    "highest workload score, which is defined by --workload_score_upper_bound.");
+TAG_FLAG(scans_started_per_sec_for_hot_tablets, experimental);
+TAG_FLAG(scans_started_per_sec_for_hot_tablets, runtime);
+
+DEFINE_int32(rows_writed_per_sec_for_hot_tablets, 1000,
+    "Minimum write rate for tablets considered 'hot' (rows/sec). If a tablet's "
+    "write rate exceed this value, compaction Ops for this tablet would have a "
+    "highest workload score,  which is defined by --workload_score_upper_bound.");
+TAG_FLAG(rows_writed_per_sec_for_hot_tablets, experimental);
+TAG_FLAG(rows_writed_per_sec_for_hot_tablets, runtime);
+
+
 using std::string;
 using strings::Substitute;
 
@@ -105,6 +124,17 @@ int32_t TabletOpBase::priority() const {
     priority = extra_config->maintenance_priority();
   }
   return priority;
+}
+
+void TabletOpBase::UpdateWorkloadScore(double* workload_score) const {
+  // We use the sum of read and write rate as a workload score for Compact Ops,
+  // this score will not exceed FLAGS_workload_score_upper_bound.
+  double read_rate = 0;
+  double write_rate = 0;
+  tablet_->CollectAndUpdateWorkloadStats(&read_rate, &write_rate);
+  read_rate /= FLAGS_scans_started_per_sec_for_hot_tablets;
+  write_rate /= FLAGS_rows_writed_per_sec_for_hot_tablets;
+  *workload_score = std::min(1.0, read_rate + write_rate) * FLAGS_workload_score_upper_bound;
 }
 
 ////////////////////////////////////////////////////////////

@@ -151,6 +151,16 @@ DEFINE_int32(max_encoded_key_size_bytes, 16 * 1024,
              "result in an error.");
 TAG_FLAG(max_encoded_key_size_bytes, unsafe);
 
+DEFINE_int32(workload_stats_rate_collection_min_interval_ms, 60 * 1000,
+             "The minimal interval in milliseconds at which we collect read/write rates.");
+TAG_FLAG(workload_stats_rate_collection_min_interval_ms, experimental);
+TAG_FLAG(workload_stats_rate_collection_min_interval_ms, runtime);
+
+DEFINE_int32(workload_stats_metric_collection_interval_ms, 5 * 60 * 1000,
+             "The interval in milliseconds at which we collect metrics.");
+TAG_FLAG(workload_stats_metric_collection_interval_ms, experimental);
+TAG_FLAG(workload_stats_metric_collection_interval_ms, runtime);
+
 METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_gauge_size(tablet, memrowset_size, "MemRowSet Memory Usage",
                          kudu::MetricUnit::kBytes,
@@ -229,7 +239,15 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     rowsets_flush_sem_(1),
     state_(kInitialized),
     last_write_time_(MonoTime::Now()),
-    last_read_time_(MonoTime::Now()) {
+    last_read_time_(MonoTime::Now()),
+    last_update_workload_stats_time_(MonoTime::Now()),
+    last_scans_started_(0),
+    last_rows_inserted_(0),
+    last_rows_upserted_(0),
+    last_rows_updated_(0),
+    last_rows_deleted_(0),
+    last_read_rate_(0.0),
+    last_write_rate_(0.0) {
       CHECK(schema()->has_column_ids());
   compaction_policy_.reset(CreateCompactionPolicy());
 
@@ -2043,6 +2061,38 @@ uint64_t Tablet::LastWriteElapsedSeconds() const {
   shared_lock<rw_spinlock> l(last_rw_time_lock_);
   DCHECK(last_write_time_.Initialized());
   return static_cast<uint64_t>((MonoTime::Now() - last_write_time_).ToSeconds());
+}
+
+void Tablet::CollectAndUpdateWorkloadStats(double* read_rate, double* write_rate) {
+  DCHECK(last_update_workload_stats_time_.Initialized());
+  MonoDelta elapse = MonoTime::Now() - last_update_workload_stats_time_;
+  if (metrics_) {
+    if (elapse.ToMilliseconds() > FLAGS_workload_stats_rate_collection_min_interval_ms) {
+      last_read_rate_ =
+          static_cast<double>(metrics_->scans_started->value() - last_scans_started_) /
+          elapse.ToSeconds();
+      last_write_rate_ =
+          static_cast<double>(metrics_->rows_inserted->value() - last_rows_inserted_ +
+                              metrics_->rows_upserted->value() - last_rows_upserted_ +
+                              metrics_->rows_updated->value() - last_rows_updated_ +
+                              metrics_->rows_deleted->value() - last_rows_deleted_) /
+          elapse.ToSeconds();
+    }
+    if (elapse.ToMilliseconds() > FLAGS_workload_stats_metric_collection_interval_ms) {
+      last_update_workload_stats_time_ = MonoTime::Now();
+      last_scans_started_ = metrics_->scans_started->value();
+      last_rows_inserted_ = metrics_->rows_inserted->value();
+      last_rows_upserted_ = metrics_->rows_upserted->value();
+      last_rows_updated_ = metrics_->rows_updated->value();
+      last_rows_deleted_ = metrics_->rows_deleted->value();
+    }
+  }
+  if (read_rate) {
+    *read_rate = last_read_rate_;
+  }
+  if (write_rate) {
+    *write_rate = last_write_rate_;
+  }
 }
 
 size_t Tablet::DeltaMemStoresSize() const {

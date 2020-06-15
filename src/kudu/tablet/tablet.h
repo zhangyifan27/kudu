@@ -489,6 +489,10 @@ class Tablet {
   // variable there.
   void UpdateLastReadTime() const;
 
+  // Collect and update recent workload statistics for the tablet.
+  // If read_rate/write_rate is not null, the recent read/write rate is returned in the out-param.
+  void CollectAndUpdateWorkloadStats(double* read_rate, double* write_rate);
+
  private:
   friend class kudu::AlterTableTest;
   friend class Iterator;
@@ -793,6 +797,17 @@ class Tablet {
   // NOTE: it's important that this is the first member to be destructed. This
   // ensures we do not attempt to collect metrics while calling the destructor.
   FunctionGaugeDetacher metric_detacher_;
+
+  MonoTime last_update_workload_stats_time_;
+  int64_t last_scans_started_;
+  int64_t last_rows_inserted_;
+  int64_t last_rows_upserted_;
+  int64_t last_rows_updated_;
+  int64_t last_rows_deleted_;
+  // Read rate is measured by scanners started per second.
+  double last_read_rate_;
+  // Write rate is measured by rows inserted/upserted/updated/deleted per second.
+  double last_write_rate_;
 
   DISALLOW_COPY_AND_ASSIGN(Tablet);
 };

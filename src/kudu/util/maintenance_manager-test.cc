@@ -66,7 +66,7 @@ DECLARE_bool(enable_maintenance_manager);
 DECLARE_int64(log_target_replay_size_mb);
 DECLARE_double(maintenance_op_multiplier);
 DECLARE_int32(max_priority_range);
-
+DECLARE_bool(enable_workload_score_for_maintenance_ops);
 namespace kudu {
 
 static const int kHistorySize = 7;
@@ -113,7 +113,8 @@ class TestMaintenanceOp : public MaintenanceOp {
  public:
   TestMaintenanceOp(const std::string& name,
                     IOUsage io_usage,
-                    int32_t priority = 0)
+                    int32_t priority = 0,
+                    double workload_score = 0.0)
     : MaintenanceOp(name, io_usage),
       ram_anchored_(500),
       logs_retained_bytes_(0),
@@ -124,7 +125,8 @@ class TestMaintenanceOp : public MaintenanceOp {
       remaining_runs_(1),
       prepared_runs_(0),
       sleep_time_(MonoDelta::FromSeconds(0)),
-      priority_(priority) {
+      priority_(priority),
+      workload_score_(workload_score) {
   }
 
   ~TestMaintenanceOp() override = default;
@@ -199,6 +201,10 @@ class TestMaintenanceOp : public MaintenanceOp {
     return priority_;
   }
 
+  void UpdateWorkloadScore(double* workload_score) const override {
+    *workload_score = workload_score_;
+  }
+
   int remaining_runs() const {
     std::lock_guard<Mutex> guard(lock_);
     return remaining_runs_;
@@ -226,6 +232,8 @@ class TestMaintenanceOp : public MaintenanceOp {
 
   // Maintenance priority.
   int32_t priority_;
+
+  double workload_score_;
 };
 
 // Create an op and wait for it to start running.  Unregister it while it is
@@ -475,13 +483,14 @@ TEST_F(MaintenanceManagerTest, TestOpFactors) {
   TestMaintenanceOp op5("op5", MaintenanceOp::HIGH_IO_USAGE, FLAGS_max_priority_range + 1);
 
   ASSERT_DOUBLE_EQ(pow(FLAGS_maintenance_op_multiplier, -FLAGS_max_priority_range),
-                   manager_->PerfImprovement(1, op1.priority()));
+                   manager_->PerfImprovement(1, 0, op1.priority()));
   ASSERT_DOUBLE_EQ(pow(FLAGS_maintenance_op_multiplier, -1),
-                   manager_->PerfImprovement(1, op2.priority()));
-  ASSERT_DOUBLE_EQ(1, manager_->PerfImprovement(1, op3.priority()));
-  ASSERT_DOUBLE_EQ(FLAGS_maintenance_op_multiplier, manager_->PerfImprovement(1, op4.priority()));
+                   manager_->PerfImprovement(1, 0, op2.priority()));
+  ASSERT_DOUBLE_EQ(1, manager_->PerfImprovement(1, 0, op3.priority()));
+  ASSERT_DOUBLE_EQ(FLAGS_maintenance_op_multiplier,
+                   manager_->PerfImprovement(1, 0, op4.priority()));
   ASSERT_DOUBLE_EQ(pow(FLAGS_maintenance_op_multiplier, FLAGS_max_priority_range),
-                   manager_->PerfImprovement(1, op5.priority()));
+                   manager_->PerfImprovement(1, 0, op5.priority()));
 }
 
 // Test priority OP launching.
@@ -514,7 +523,7 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   // to exit entirely instead of sleeping.
 
   // Ops are listed here in perf improvement order, which is a function of the
-  // op's raw perf improvement as well as its priority.
+  // op's raw perf improvement, workload score and its priority.
   TestMaintenanceOp op1("op1", MaintenanceOp::HIGH_IO_USAGE, -FLAGS_max_priority_range - 1);
   op1.set_perf_improvement(10);
   op1.set_remaining_runs(1);
@@ -535,8 +544,8 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   op4.set_remaining_runs(1);
   op4.set_sleep_time(MonoDelta::FromMilliseconds(1));
 
-  TestMaintenanceOp op5("op5", MaintenanceOp::HIGH_IO_USAGE, 0);
-  op5.set_perf_improvement(12);
+  TestMaintenanceOp op5("op5", MaintenanceOp::HIGH_IO_USAGE, 1, 1.0);
+  op5.set_perf_improvement(10);
   op5.set_remaining_runs(1);
   op5.set_sleep_time(MonoDelta::FromMilliseconds(1));
 
@@ -553,6 +562,7 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   manager_->RegisterOp(&op5);
   manager_->RegisterOp(&op6);
   FLAGS_enable_maintenance_manager = true;
+  FLAGS_enable_workload_score_for_maintenance_ops = true;
 
   // From this point forward if an ASSERT fires, we'll hit a CHECK failure if
   // we don't unregister an op before it goes out of scope.
@@ -568,7 +578,7 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   ASSERT_EVENTUALLY([&]() {
     MaintenanceManagerStatusPB status_pb;
     manager_->GetMaintenanceManagerStatusDump(&status_pb);
-    ASSERT_EQ(status_pb.completed_operations_size(), 7);
+    ASSERT_EQ(7, status_pb.completed_operations_size());
   });
 
   // Wait for instances to complete by shutting down the maintenance manager.
@@ -578,7 +588,7 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   // Check that running instances are removed from collection after completion.
   MaintenanceManagerStatusPB status_pb;
   manager_->GetMaintenanceManagerStatusDump(&status_pb);
-  ASSERT_EQ(status_pb.running_operations_size(), 0);
+  ASSERT_EQ(0, status_pb.running_operations_size());
 
   // Check that ops were executed in perf improvement order (from greatest to
   // least improvement). Note that completed ops are listed in _reverse_ execution order.

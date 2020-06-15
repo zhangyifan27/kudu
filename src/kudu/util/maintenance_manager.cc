@@ -110,6 +110,13 @@ TAG_FLAG(max_priority_range, advanced);
 TAG_FLAG(max_priority_range, experimental);
 TAG_FLAG(max_priority_range, runtime);
 
+DEFINE_bool(enable_workload_score_for_maintenance_ops, false,
+            "Whether to enable workload score for maintenance operations that will "
+            "improve performance, such as flush and compaction. If enabled, maintenance"
+            "manager will perform OPs for 'hot' tablets in priority.");
+TAG_FLAG(enable_workload_score_for_maintenance_ops, experimental);
+TAG_FLAG(enable_workload_score_for_maintenance_ops, runtime);
+
 namespace kudu {
 
 MaintenanceOpStats::MaintenanceOpStats() {
@@ -408,7 +415,12 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
                         op->name(), data_retained_bytes);
     }
 
-    const auto perf_improvement = PerfImprovement(stats.perf_improvement(), op->priority());
+    double workload_score = 0.0;
+    if (FLAGS_enable_workload_score_for_maintenance_ops) {
+      op->UpdateWorkloadScore(&workload_score);
+    }
+    const auto perf_improvement =
+        PerfImprovement(stats.perf_improvement(), workload_score, op->priority());
     if ((!best_perf_improvement_op) ||
         (perf_improvement > best_perf_improvement)) {
       best_perf_improvement_op = op;
@@ -472,14 +484,20 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
   return {nullptr, "no ops with positive improvement"};
 }
 
-double MaintenanceManager::PerfImprovement(double perf_improvement, int32_t priority) const {
+double MaintenanceManager::PerfImprovement(double perf_improvement,
+                                           double workload_score,
+                                           int32_t priority) {
+  if (perf_improvement == 0) {
+    return 0;
+  }
+  double perf_score = perf_improvement + workload_score;
   if (priority == 0) {
-    return perf_improvement;
+    return perf_score;
   }
 
   priority = std::max(priority, -FLAGS_max_priority_range);
   priority = std::min(priority, FLAGS_max_priority_range);
-  return perf_improvement * std::pow(FLAGS_maintenance_op_multiplier, priority);
+  return perf_score * std::pow(FLAGS_maintenance_op_multiplier, priority);
 }
 
 void MaintenanceManager::LaunchOp(MaintenanceOp* op) {
