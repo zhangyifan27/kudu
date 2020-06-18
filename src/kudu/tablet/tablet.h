@@ -448,6 +448,8 @@ class Tablet {
 
   const std::string& tablet_id() const { return metadata_->tablet_id(); }
 
+  const std::string& table_name() const { return metadata_->table_name(); }
+
   // Return the metrics for this tablet.
   // May be NULL in unit tests, etc.
   TabletMetrics* metrics() { return metrics_.get(); }
