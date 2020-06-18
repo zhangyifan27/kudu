@@ -411,11 +411,20 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
 
     const auto perf_improvement =
         PerfImprovement(stats.perf_improvement(), stats.workload_score(), op->priority());
+    if (perf_improvement > 0) {
+      VLOG(0) <<
+          Substitute("Op $0, perf_improvement = $1, workload_score = $2, final perf score = $3",
+                     op->name(), stats.perf_improvement(), stats.workload_score(), perf_improvement);
+    }
     if ((!best_perf_improvement_op) ||
         (perf_improvement > best_perf_improvement)) {
       best_perf_improvement_op = op;
       best_perf_improvement = perf_improvement;
     }
+  }
+  if (best_perf_improvement > 0) {
+    VLOG(0) << Substitute("Best Op $0, perf score = $1",
+                          best_perf_improvement_op->name(), best_perf_improvement);
   }
 
   // Look at ops that we can run quickly that free up log retention.

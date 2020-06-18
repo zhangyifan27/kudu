@@ -60,8 +60,9 @@ class TabletReplicaOpBase : public MaintenanceOp {
 class FlushMRSOp : public TabletReplicaOpBase {
  public:
   explicit FlushMRSOp(TabletReplica* tablet_replica)
-    : TabletReplicaOpBase(StringPrintf("FlushMRSOp(%s)",
-                                       tablet_replica->tablet()->tablet_id().c_str()),
+    : TabletReplicaOpBase(StringPrintf("FlushMRSOp(%s %s)",
+                                       tablet_replica->tablet()->tablet_id().c_str(),
+                                       tablet_replica->tablet()->table_name().c_str()),
                           MaintenanceOp::HIGH_IO_USAGE,
                           tablet_replica) {
     time_since_flush_.start();
@@ -88,8 +89,9 @@ class FlushMRSOp : public TabletReplicaOpBase {
 class FlushDeltaMemStoresOp : public TabletReplicaOpBase {
  public:
   explicit FlushDeltaMemStoresOp(TabletReplica* tablet_replica)
-    : TabletReplicaOpBase(StringPrintf("FlushDeltaMemStoresOp(%s)",
-                                       tablet_replica->tablet()->tablet_id().c_str()),
+    : TabletReplicaOpBase(StringPrintf("FlushDeltaMemStoresOp(%s %s)",
+                                       tablet_replica->tablet()->tablet_id().c_str(),
+                                       tablet_replica->tablet()->table_name().c_str()),
                           MaintenanceOp::HIGH_IO_USAGE,
                           tablet_replica) {
     time_since_flush_.start();

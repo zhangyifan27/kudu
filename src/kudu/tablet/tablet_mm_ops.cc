@@ -118,7 +118,7 @@ int32_t TabletOpBase::priority() const {
 ////////////////////////////////////////////////////////////
 
 CompactRowSetsOp::CompactRowSetsOp(Tablet* tablet)
-  : TabletOpBase(Substitute("CompactRowSetsOp($0)", tablet->tablet_id()),
+  : TabletOpBase(Substitute("CompactRowSetsOp($0 $1)", tablet->tablet_id(), tablet->table_name()),
                  MaintenanceOp::HIGH_IO_USAGE, tablet),
     last_num_mrs_flushed_(0),
     last_num_rs_compacted_(0) {
@@ -192,7 +192,7 @@ scoped_refptr<AtomicGauge<uint32_t> > CompactRowSetsOp::RunningGauge() const {
 ////////////////////////////////////////////////////////////
 
 MinorDeltaCompactionOp::MinorDeltaCompactionOp(Tablet* tablet)
-  : TabletOpBase(Substitute("MinorDeltaCompactionOp($0)", tablet->tablet_id()),
+  : TabletOpBase(Substitute("MinorDeltaCompactionOp($0 $1)", tablet->tablet_id(), tablet->table_name()),
                  MaintenanceOp::HIGH_IO_USAGE, tablet),
     last_num_mrs_flushed_(0),
     last_num_dms_flushed_(0),
@@ -275,7 +275,7 @@ scoped_refptr<AtomicGauge<uint32_t> > MinorDeltaCompactionOp::RunningGauge() con
 ////////////////////////////////////////////////////////////
 
 MajorDeltaCompactionOp::MajorDeltaCompactionOp(Tablet* tablet)
-  : TabletOpBase(Substitute("MajorDeltaCompactionOp($0)", tablet->tablet_id()),
+  : TabletOpBase(Substitute("MajorDeltaCompactionOp($0 $1)", tablet->tablet_id(), tablet->table_name()),
                  MaintenanceOp::HIGH_IO_USAGE, tablet),
     last_num_mrs_flushed_(0),
     last_num_dms_flushed_(0),
