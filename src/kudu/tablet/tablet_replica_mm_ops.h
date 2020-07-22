@@ -53,8 +53,6 @@ class TabletReplicaOpBase : public MaintenanceOp {
  protected:
   int32_t priority() const override;
 
-  void UpdateWorkloadScore(double* workload_score) const override;
-
   TabletReplica *const tablet_replica_;
 };
 

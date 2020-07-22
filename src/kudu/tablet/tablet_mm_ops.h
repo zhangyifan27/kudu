@@ -43,7 +43,7 @@ class TabletOpBase : public MaintenanceOp {
  protected:
   int32_t priority() const override;
 
-  void UpdateWorkloadScore(double* workload_score) const override;
+  void SetWorkloadScoreForCompact(MaintenanceOpStats* stats) const;
 
   Tablet* const tablet_;
 };

@@ -81,7 +81,6 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
-#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -160,6 +159,24 @@ DEFINE_int32(workload_stats_metric_collection_interval_ms, 5 * 60 * 1000,
              "The interval in milliseconds at which we collect metrics.");
 TAG_FLAG(workload_stats_metric_collection_interval_ms, experimental);
 TAG_FLAG(workload_stats_metric_collection_interval_ms, runtime);
+
+DEFINE_double(workload_score_upper_bound, 1.0, "Upper bound for workload score.");
+TAG_FLAG(workload_score_upper_bound, experimental);
+TAG_FLAG(workload_score_upper_bound, runtime);
+
+DEFINE_int32(scans_started_per_sec_for_hot_tablets, 1,
+    "Minimum read rate for tablets considered 'hot' (scans/sec). If a tablet's "
+    "read rate exceed this value, flush/compaction Ops for this tablet would have a "
+    "highest workload score, which is defined by --workload_score_upper_bound.");
+TAG_FLAG(scans_started_per_sec_for_hot_tablets, experimental);
+TAG_FLAG(scans_started_per_sec_for_hot_tablets, runtime);
+
+DEFINE_int32(rows_writed_per_sec_for_hot_tablets, 1000,
+    "Minimum write rate for tablets considered 'hot' (rows/sec). If a tablet's "
+    "write rate exceed this value, compaction Ops for this tablet would have a "
+    "highest workload score, which is defined by --workload_score_upper_bound.");
+TAG_FLAG(rows_writed_per_sec_for_hot_tablets, experimental);
+TAG_FLAG(rows_writed_per_sec_for_hot_tablets, runtime);
 
 METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_gauge_size(tablet, memrowset_size, "MemRowSet Memory Usage",
@@ -246,8 +263,8 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     last_rows_upserted_(0),
     last_rows_updated_(0),
     last_rows_deleted_(0),
-    last_read_rate_(0.0),
-    last_write_rate_(0.0) {
+    last_read_score_(0.0),
+    last_write_score_(0.0) {
       CHECK(schema()->has_column_ids());
   compaction_policy_.reset(CreateCompactionPolicy());
 
@@ -2063,20 +2080,27 @@ uint64_t Tablet::LastWriteElapsedSeconds() const {
   return static_cast<uint64_t>((MonoTime::Now() - last_write_time_).ToSeconds());
 }
 
-void Tablet::CollectAndUpdateWorkloadStats(double* read_rate, double* write_rate) {
+double Tablet::CollectAndUpdateWorkloadStats(MaintenanceOp::PerfImprovementOpType type) const {
   DCHECK(last_update_workload_stats_time_.Initialized());
+  double workload_score = 0;
   MonoDelta elapse = MonoTime::Now() - last_update_workload_stats_time_;
   if (metrics_) {
     if (elapse.ToMilliseconds() > FLAGS_workload_stats_rate_collection_min_interval_ms) {
-      last_read_rate_ =
+      double last_read_rate =
           static_cast<double>(metrics_->scans_started->value() - last_scans_started_) /
           elapse.ToSeconds();
-      last_write_rate_ =
+      last_read_score_ =
+          std::min(1.0, last_read_rate / FLAGS_scans_started_per_sec_for_hot_tablets) *
+          FLAGS_workload_score_upper_bound;
+      double last_write_rate =
           static_cast<double>(metrics_->rows_inserted->value() - last_rows_inserted_ +
                               metrics_->rows_upserted->value() - last_rows_upserted_ +
                               metrics_->rows_updated->value() - last_rows_updated_ +
                               metrics_->rows_deleted->value() - last_rows_deleted_) /
           elapse.ToSeconds();
+      last_write_score_ =
+          std::min(1.0, last_write_rate / FLAGS_rows_writed_per_sec_for_hot_tablets) *
+          FLAGS_workload_score_upper_bound;
     }
     if (elapse.ToMilliseconds() > FLAGS_workload_stats_metric_collection_interval_ms) {
       last_update_workload_stats_time_ = MonoTime::Now();
@@ -2087,12 +2111,13 @@ void Tablet::CollectAndUpdateWorkloadStats(double* read_rate, double* write_rate
       last_rows_deleted_ = metrics_->rows_deleted->value();
     }
   }
-  if (read_rate) {
-    *read_rate = last_read_rate_;
+  if (type == MaintenanceOp::FLUSH_OP) {
+    workload_score = last_read_score_;
+  } else if (type == MaintenanceOp::COMPACT_OP) {
+    workload_score = std::min(FLAGS_workload_score_upper_bound,
+                              last_read_score_ + last_write_score_);
   }
-  if (write_rate) {
-    *write_rate = last_write_rate_;
-  }
+  return workload_score;
 }
 
 size_t Tablet::DeltaMemStoresSize() const {

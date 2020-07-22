@@ -130,6 +130,7 @@ void MaintenanceOpStats::Clear() {
   logs_retained_bytes_ = 0;
   data_retained_bytes_ = 0;
   perf_improvement_ = 0;
+  workload_score_ = 0;
   last_modified_ = MonoTime();
 }
 
@@ -415,12 +416,8 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
                         op->name(), data_retained_bytes);
     }
 
-    double workload_score = 0.0;
-    if (FLAGS_enable_workload_score_for_maintenance_ops) {
-      op->UpdateWorkloadScore(&workload_score);
-    }
     const auto perf_improvement =
-        PerfImprovement(stats.perf_improvement(), workload_score, op->priority());
+        PerfImprovement(stats.perf_improvement(), stats.workload_score(), op->priority());
     if ((!best_perf_improvement_op) ||
         (perf_improvement > best_perf_improvement)) {
       best_perf_improvement_op = op;
@@ -487,9 +484,6 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
 double MaintenanceManager::PerfImprovement(double perf_improvement,
                                            double workload_score,
                                            int32_t priority) {
-  if (perf_improvement == 0) {
-    return 0;
-  }
   double perf_score = perf_improvement + workload_score;
   if (priority == 0) {
     return perf_score;

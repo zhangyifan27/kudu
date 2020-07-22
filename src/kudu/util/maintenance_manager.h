@@ -106,6 +106,16 @@ class MaintenanceOpStats {
     perf_improvement_ = perf_improvement;
   }
 
+  double workload_score() const {
+    DCHECK(valid_);
+    return workload_score_;
+  }
+
+  void set_workload_score(double workload_score) {
+    UpdateLastModified();
+    workload_score_ = workload_score;
+  }
+
   const MonoTime& last_modified() const {
     DCHECK(valid_);
     return last_modified_;
@@ -146,6 +156,8 @@ class MaintenanceOpStats {
   // absolute scale (yet TBD).
   double perf_improvement_;
 
+  double workload_score_;
+
   // The last time that the stats were modified.
   MonoTime last_modified_;
 };
@@ -177,6 +189,11 @@ class MaintenanceOp {
   enum IOUsage {
     LOW_IO_USAGE, // Low impact operations like removing a file, updating metadata.
     HIGH_IO_USAGE // Everything else.
+  };
+
+  enum PerfImprovementOpType {
+    FLUSH_OP,
+    COMPACT_OP
   };
 
   explicit MaintenanceOp(std::string name, IOUsage io_usage);
@@ -231,10 +248,6 @@ class MaintenanceOp {
   friend class AlterTableTest;
 
   virtual int32_t priority() const = 0;
-
-  // Update the op workload_score. This will be called every scheduling period
-  // (about a few times a second).
-  virtual void UpdateWorkloadScore(double* workload_score) const = 0;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(MaintenanceOp);

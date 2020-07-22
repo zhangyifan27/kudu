@@ -162,6 +162,7 @@ class TestMaintenanceOp : public MaintenanceOp {
     stats->set_ram_anchored(ram_anchored_);
     stats->set_logs_retained_bytes(logs_retained_bytes_);
     stats->set_perf_improvement(perf_improvement_);
+    stats->set_workload_score(workload_score_);
   }
 
   void set_remaining_runs(int runs) {
@@ -199,10 +200,6 @@ class TestMaintenanceOp : public MaintenanceOp {
 
   int32_t priority() const override {
     return priority_;
-  }
-
-  void UpdateWorkloadScore(double* workload_score) const override {
-    *workload_score = workload_score_;
   }
 
   int remaining_runs() const {

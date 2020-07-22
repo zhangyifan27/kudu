@@ -75,6 +75,7 @@ DEFINE_int32(flush_threshold_secs, 2 * 60,
 TAG_FLAG(flush_threshold_secs, experimental);
 TAG_FLAG(flush_threshold_secs, runtime);
 
+DECLARE_bool(enable_workload_score_for_maintenance_ops);
 DECLARE_double(workload_score_upper_bound);
 DECLARE_int32(scans_started_per_sec_for_hot_tablets);
 
@@ -150,17 +151,6 @@ int32_t TabletReplicaOpBase::priority() const {
   return priority;
 }
 
-void TabletReplicaOpBase::UpdateWorkloadScore(double* workload_score) const {
-  // We use the read rate as a workload score for flush ops, because 'perf_improvement'
-  // is related to write rate in a way, and flush ops could speed up reads, so we prefer
-  // to do Flush Ops for read heavy tablets. This score will not exceed
-  // FLAGS_workload_score_upper_bound.
-  double read_rate = 0;
-  tablet_replica_->tablet()->CollectAndUpdateWorkloadStats(&read_rate, /*write_rate=*/nullptr);
-  read_rate /= FLAGS_scans_started_per_sec_for_hot_tablets;
-  *workload_score = std::min(1.0, read_rate) * FLAGS_workload_score_upper_bound;
-}
-
 //
 // FlushMRSOp.
 //
@@ -190,6 +180,12 @@ void FlushMRSOp::UpdateStats(MaintenanceOpStats* stats) {
   stats->set_ram_anchored(tablet_replica_->tablet()->MemRowSetSize());
   stats->set_logs_retained_bytes(
       tablet_replica_->tablet()->MemRowSetLogReplaySize(replay_size_map));
+
+  if (FLAGS_enable_workload_score_for_maintenance_ops) {
+    double workload_score =
+        tablet_replica_->tablet()->CollectAndUpdateWorkloadStats(MaintenanceOp::FLUSH_OP);
+    stats->set_workload_score(workload_score);
+  }
 
   // TODO(todd): use workload statistics here to find out how "hot" the tablet has
   // been in the last 5 minutes.
@@ -260,6 +256,12 @@ void FlushDeltaMemStoresOp::UpdateStats(MaintenanceOpStats* stats) {
   stats->set_ram_anchored(dms_size);
   stats->set_runnable(true);
   stats->set_logs_retained_bytes(retention_size);
+
+  if (FLAGS_enable_workload_score_for_maintenance_ops) {
+    double workload_score =
+        tablet_replica_->tablet()->CollectAndUpdateWorkloadStats(MaintenanceOp::FLUSH_OP);
+    stats->set_workload_score(workload_score);
+  }
 
   FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(
       stats,

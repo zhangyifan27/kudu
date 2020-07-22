@@ -45,6 +45,7 @@
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/rw_semaphore.h"
@@ -56,9 +57,6 @@ class AlterTableTest;
 class ConstContiguousRow;
 class EncodedKey;
 class KeyRange;
-class MaintenanceManager;
-class MaintenanceOp;
-class MaintenanceOpStats;
 class MemTracker;
 class RowBlock;
 class ScanSpec;
@@ -490,8 +488,7 @@ class Tablet {
   void UpdateLastReadTime() const;
 
   // Collect and update recent workload statistics for the tablet.
-  // If read_rate/write_rate is not null, the recent read/write rate is returned in the out-param.
-  void CollectAndUpdateWorkloadStats(double* read_rate, double* write_rate);
+  double CollectAndUpdateWorkloadStats(kudu::MaintenanceOp::PerfImprovementOpType type) const;
 
  private:
   friend class kudu::AlterTableTest;
@@ -798,16 +795,14 @@ class Tablet {
   // ensures we do not attempt to collect metrics while calling the destructor.
   FunctionGaugeDetacher metric_detacher_;
 
-  MonoTime last_update_workload_stats_time_;
-  int64_t last_scans_started_;
-  int64_t last_rows_inserted_;
-  int64_t last_rows_upserted_;
-  int64_t last_rows_updated_;
-  int64_t last_rows_deleted_;
-  // Read rate is measured by scanners started per second.
-  double last_read_rate_;
-  // Write rate is measured by rows inserted/upserted/updated/deleted per second.
-  double last_write_rate_;
+  mutable MonoTime last_update_workload_stats_time_;
+  mutable int64_t last_scans_started_;
+  mutable int64_t last_rows_inserted_;
+  mutable int64_t last_rows_upserted_;
+  mutable int64_t last_rows_updated_;
+  mutable int64_t last_rows_deleted_;
+  mutable double last_read_score_;
+  mutable double last_write_score_;
 
   DISALLOW_COPY_AND_ASSIGN(Tablet);
 };
