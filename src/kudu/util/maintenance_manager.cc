@@ -110,13 +110,6 @@ TAG_FLAG(max_priority_range, advanced);
 TAG_FLAG(max_priority_range, experimental);
 TAG_FLAG(max_priority_range, runtime);
 
-DEFINE_bool(enable_workload_score_for_maintenance_ops, false,
-            "Whether to enable workload score for maintenance operations that will "
-            "improve performance, such as flush and compaction. If enabled, maintenance"
-            "manager will perform OPs for 'hot' tablets in priority.");
-TAG_FLAG(enable_workload_score_for_maintenance_ops, experimental);
-TAG_FLAG(enable_workload_score_for_maintenance_ops, runtime);
-
 namespace kudu {
 
 MaintenanceOpStats::MaintenanceOpStats() {
@@ -484,6 +477,9 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
 double MaintenanceManager::PerfImprovement(double perf_improvement,
                                            double workload_score,
                                            int32_t priority) {
+  if (perf_improvement == 0) {
+    return 0;
+  }
   double perf_score = perf_improvement + workload_score;
   if (priority == 0) {
     return perf_score;

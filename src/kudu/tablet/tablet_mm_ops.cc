@@ -83,7 +83,11 @@ DEFINE_bool(enable_deleted_rowset_gc, true,
     "considered ancient history (see --tablet_history_max_age_sec) are deleted.");
 TAG_FLAG(enable_deleted_rowset_gc, runtime);
 
-DECLARE_bool(enable_workload_score_for_maintenance_ops);
+DEFINE_bool(enable_workload_score_for_maintenance_ops, false,
+            "Whether to enable prioritization of maintenance operations based on "
+            "whether there are on-going workloads, favoring ops of 'hot' tablets.");
+TAG_FLAG(enable_workload_score_for_maintenance_ops, experimental);
+TAG_FLAG(enable_workload_score_for_maintenance_ops, runtime);
 
 using std::string;
 using strings::Substitute;

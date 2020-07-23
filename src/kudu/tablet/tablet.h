@@ -488,7 +488,7 @@ class Tablet {
   void UpdateLastReadTime() const;
 
   // Collect and update recent workload statistics for the tablet.
-  double CollectAndUpdateWorkloadStats(kudu::MaintenanceOp::PerfImprovementOpType type) const;
+  double CollectAndUpdateWorkloadStats(MaintenanceOp::PerfImprovementOpType type) const;
 
  private:
   friend class kudu::AlterTableTest;

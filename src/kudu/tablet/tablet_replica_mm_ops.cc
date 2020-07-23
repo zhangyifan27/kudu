@@ -76,8 +76,6 @@ TAG_FLAG(flush_threshold_secs, experimental);
 TAG_FLAG(flush_threshold_secs, runtime);
 
 DECLARE_bool(enable_workload_score_for_maintenance_ops);
-DECLARE_double(workload_score_upper_bound);
-DECLARE_int32(scans_started_per_sec_for_hot_tablets);
 
 METRIC_DEFINE_gauge_uint32(tablet, log_gc_running,
                            "Log GCs Running",
@@ -187,8 +185,6 @@ void FlushMRSOp::UpdateStats(MaintenanceOpStats* stats) {
     stats->set_workload_score(workload_score);
   }
 
-  // TODO(todd): use workload statistics here to find out how "hot" the tablet has
-  // been in the last 5 minutes.
   FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(
       stats,
       time_since_flush_.elapsed().wall_millis());

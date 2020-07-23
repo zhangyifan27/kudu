@@ -66,10 +66,9 @@ DECLARE_bool(enable_maintenance_manager);
 DECLARE_int64(log_target_replay_size_mb);
 DECLARE_double(maintenance_op_multiplier);
 DECLARE_int32(max_priority_range);
-DECLARE_bool(enable_workload_score_for_maintenance_ops);
 namespace kudu {
 
-static const int kHistorySize = 7;
+static const int kHistorySize = 8;
 static const char kFakeUuid[] = "12345";
 
 class MaintenanceManagerTest : public KuduTest {
@@ -541,8 +540,8 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   op4.set_remaining_runs(1);
   op4.set_sleep_time(MonoDelta::FromMilliseconds(1));
 
-  TestMaintenanceOp op5("op5", MaintenanceOp::HIGH_IO_USAGE, 1, 1.0);
-  op5.set_perf_improvement(10);
+  TestMaintenanceOp op5("op5", MaintenanceOp::HIGH_IO_USAGE, 0);
+  op5.set_perf_improvement(12);
   op5.set_remaining_runs(1);
   op5.set_sleep_time(MonoDelta::FromMilliseconds(1));
 
@@ -551,6 +550,11 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   op6.set_remaining_runs(1);
   op6.set_sleep_time(MonoDelta::FromMilliseconds(1));
 
+  TestMaintenanceOp op7("op7", MaintenanceOp::HIGH_IO_USAGE, 0, 10);
+  op7.set_perf_improvement(9);
+  op7.set_remaining_runs(1);
+  op7.set_sleep_time(MonoDelta::FromMilliseconds(1));
+
   FLAGS_enable_maintenance_manager = false;
   manager_->RegisterOp(&op1);
   manager_->RegisterOp(&op2);
@@ -558,8 +562,8 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
   manager_->RegisterOp(&op4);
   manager_->RegisterOp(&op5);
   manager_->RegisterOp(&op6);
+  manager_->RegisterOp(&op7);
   FLAGS_enable_maintenance_manager = true;
-  FLAGS_enable_workload_score_for_maintenance_ops = true;
 
   // From this point forward if an ASSERT fires, we'll hit a CHECK failure if
   // we don't unregister an op before it goes out of scope.
@@ -570,12 +574,13 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
     manager_->UnregisterOp(&op4);
     manager_->UnregisterOp(&op5);
     manager_->UnregisterOp(&op6);
+    manager_->UnregisterOp(&op7);
   });
 
   ASSERT_EVENTUALLY([&]() {
     MaintenanceManagerStatusPB status_pb;
     manager_->GetMaintenanceManagerStatusDump(&status_pb);
-    ASSERT_EQ(7, status_pb.completed_operations_size());
+    ASSERT_EQ(8, status_pb.completed_operations_size());
   });
 
   // Wait for instances to complete by shutting down the maintenance manager.
@@ -595,6 +600,7 @@ TEST_F(MaintenanceManagerTest, TestPriorityOpLaunch) {
                             "op4",
                             "op5",
                             "op6",
+                            "op7",
                             "early"});
   ASSERT_EQ(ordered_ops.size(), status_pb.completed_operations().size());
   for (const auto& instance : status_pb.completed_operations()) {

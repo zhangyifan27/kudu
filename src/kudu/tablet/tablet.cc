@@ -1876,9 +1876,6 @@ void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
     return;
   }
 
-  // TODO: use workload statistics here to find out how "hot" the tablet has
-  // been in the last 5 minutes, and somehow scale the compaction quality
-  // based on that, so we favor hot tablets.
   double quality = 0;
   unordered_set<const RowSet*> picked_set_ignored;
 
@@ -2112,8 +2109,13 @@ double Tablet::CollectAndUpdateWorkloadStats(MaintenanceOp::PerfImprovementOpTyp
     }
   }
   if (type == MaintenanceOp::FLUSH_OP) {
+    // Flush ops are already scored based on how hot the tablet is
+    // for writes, so we'll only adjust the workload score based on
+    // how hot the tablet is for reads.
     workload_score = last_read_score_;
   } else if (type == MaintenanceOp::COMPACT_OP) {
+    // Since compactions may improve both read and write performance, increase
+    // the workload score based on the read and write rate to the tablet.
     workload_score = std::min(FLAGS_workload_score_upper_bound,
                               last_read_score_ + last_write_score_);
   }
