@@ -395,7 +395,7 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
         tablet_id, req->replica_type_filter(),
         locs_pb,
         req->intern_ts_infos_in_response() ? &infos_dict : nullptr,
-        make_optional<const string&>(rpc->remote_user().username()));
+        rpc->remote_user().username());
     if (!s.ok()) {
       resp->mutable_tablet_locations()->RemoveLast();
 
@@ -432,8 +432,8 @@ void MasterServiceImpl::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->IsCreateTableDone(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  auto s = server_->catalog_manager()->IsCreateTableDone(
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -472,8 +472,8 @@ void MasterServiceImpl::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->IsAlterTableDone(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  auto s = server_->catalog_manager()->IsAlterTableDone(
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -486,8 +486,8 @@ void MasterServiceImpl::ListTables(const ListTablesRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->ListTables(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  auto s = server_->catalog_manager()->ListTables(
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -500,7 +500,7 @@ void MasterServiceImpl::GetTableStatistics(const GetTableStatisticsRequestPB* re
     return;
   }
   Status s = server_->catalog_manager()->GetTableStatistics(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -520,7 +520,7 @@ void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
   Status s = server_->catalog_manager()->GetTableLocations(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+        req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -534,8 +534,8 @@ void MasterServiceImpl::GetTableSchema(const GetTableSchemaRequestPB* req,
   }
 
   Status s = server_->catalog_manager()->GetTableSchema(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()),
-      FLAGS_master_support_authz_tokens ? server_->token_signer() : nullptr);
+        req, resp, rpc->remote_user().username(),
+        FLAGS_master_support_authz_tokens ? server_->token_signer() : nullptr);
   CheckRespErrorOrSetUnknown(s, resp);
   if (resp->has_error()) {
     // If there was an application error, respond to the RPC.

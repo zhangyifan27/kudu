@@ -311,12 +311,11 @@ class MasterAuthzITestHarness {
   // Creates db.table and db.second_table.
   virtual Status SetUpTables(const unique_ptr<ExternalMiniCluster>& cluster,
                              const shared_ptr<KuduClient>& client) {
+    static const string kUser = kAdminUser;
     RETURN_NOT_OK(CreateKuduTable(kDatabaseName, kTableName, client));
     RETURN_NOT_OK(CreateKuduTable(kDatabaseName, kSecondTable, client));
-    CheckTable(kDatabaseName, kTableName,
-               make_optional<const string&>(kAdminUser), cluster, client);
-    CheckTable(kDatabaseName, kSecondTable,
-               make_optional<const string&>(kAdminUser), cluster, client);
+    CheckTable(kDatabaseName, kTableName, kUser, cluster, client);
+    CheckTable(kDatabaseName, kSecondTable, kUser, cluster, client);
     return Status::OK();
   }
 
@@ -832,8 +831,8 @@ TEST_P(MasterAuthzITest, TestTrustedUserAcl) {
             tables_set);
 
   ASSERT_OK(this->CreateKuduTable(kDatabaseName, "new_table"));
-  NO_FATALS(this->CheckTable(kDatabaseName, "new_table",
-                             make_optional<const string&>(kImpalaUser)));
+  const string user = kImpalaUser;
+  NO_FATALS(this->CheckTable(kDatabaseName, "new_table", user));
 }
 
 TEST_P(MasterAuthzITest, TestAuthzListTables) {
@@ -899,7 +898,7 @@ TEST_P(MasterAuthzITest, TestMismatchedTable) {
   ASSERT_OK(this->cluster_->CreateClient(nullptr, &client));
   shared_ptr<KuduTable> table;
   ASSERT_OK(client->OpenTable(table_name_a, &table));
-  optional<const string&> table_id_a = make_optional<const string&>(table->id());
+  optional<const string&> table_id_a = table->id();
 
   // Log back as 'test-user'.
   ASSERT_OK(this->cluster_->kdc()->Kinit(kTestUser));
@@ -1099,47 +1098,6 @@ class MasterSentryITest : public MasterAuthzITestBase {
     NO_FATALS(SetUpCluster(kSentry));
   }
 };
-
-// Checks the user with table ownership automatically has ALL privilege on the
-// table. User 'test-user' can delete the same table without specifically
-// granting 'DROP ON TABLE'. Note that ownership population between the HMS and
-// the Sentry service happens synchronously, therefore, the table deletion
-// should succeed right after the table creation.
-// NOTE: this behavior is specific to Sentry,  so we don't parameterize.
-TEST_F(MasterSentryITest, TestTableOwnership) {
-  ASSERT_OK(GrantCreateTablePrivilege({ kDatabaseName }));
-  ASSERT_OK(CreateKuduTable(kDatabaseName, "new_table"));
-  NO_FATALS(CheckTable(kDatabaseName, "new_table",
-                       make_optional<const string&>(kTestUser)));
-
-  // TODO(hao): test create a table with a different owner than the client’s username?
-  ASSERT_OK(client_->DeleteTable(Substitute("$0.$1", kDatabaseName, "new_table")));
-  NO_FATALS(CheckTableDoesNotExist(kDatabaseName, "new_table"));
-}
-
-// Checks Sentry privileges are synchronized upon table rename in the HMS.
-TEST_F(MasterSentryITest, TestRenameTablePrivilegeTransfer) {
-  ASSERT_OK(GrantRenameTablePrivilege({ kDatabaseName, kTableName }));
-  ASSERT_OK(RenameTable({ Substitute("$0.$1", kDatabaseName, kTableName),
-                          Substitute("$0.$1", kDatabaseName, "b") }));
-  NO_FATALS(CheckTable(kDatabaseName, "b",
-                       make_optional<const string&>(kAdminUser)));
-
-  unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(
-      Substitute("$0.$1", kDatabaseName, "b")));
-  alterer->DropColumn("int16_val");
-
-  // Note that unlike table creation, there could be a delay between the table renaming
-  // in Kudu and the privilege renaming in Sentry. Because Kudu uses the transactional
-  // listener of the HMS to get notification of table alteration events, while Sentry
-  // uses post event listener (which is executed outside the HMS transaction). There
-  // is a chance that Kudu already finish the table renaming but the privilege renaming
-  // hasn't been reflected in the Sentry service.
-  ASSERT_EVENTUALLY([&] {
-    ASSERT_OK(alterer->Alter());
-  });
-  NO_FATALS(CheckTable(kDatabaseName, "b", make_optional<const string&>(kAdminUser)));
-}
 
 class AuthzErrorHandlingTest :
     public MasterAuthzITestBase,

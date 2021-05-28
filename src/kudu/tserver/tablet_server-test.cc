@@ -2514,7 +2514,6 @@ TEST_F(TabletServerTest, TestConcurrentAccessToOneScanner) {
   InsertTestRowsRemote(0, kNumRows, 1, nullptr, kTabletId);
 
   FLAGS_scanner_batch_size_rows = 10;
-  FLAGS_scanner_unregister_on_invalid_seq_id = false;
   ScanResponsePB open_resp;
   NO_FATALS(OpenScannerWithAllColumns(&open_resp));
 

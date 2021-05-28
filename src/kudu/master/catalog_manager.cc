@@ -60,6 +60,7 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
+#include <boost/optional/optional_io.hpp> 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
@@ -1731,8 +1732,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       e->mutable_metadata()->AbortMutation();
     }
   });
-  optional<string> dimension_label =
-      req.has_dimension_label() ? make_optional<string>(req.dimension_label()) : none;
+  const optional<string> dimension_label =
+      req.has_dimension_label() ? boost::make_optional(req.dimension_label()) : none;
   for (const Partition& partition : partitions) {
     PartitionPB partition_pb;
     partition.ToPB(&partition_pb);
@@ -2015,8 +2016,10 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  optional<const string&> user = rpc ?
-      make_optional<const string&>(rpc->remote_user().username()) : none;
+  optional<const string&> user;
+  if (rpc) {
+    user = rpc->remote_user().username();
+  }
 
   // If the HMS integration is enabled and the table should be deleted in the HMS,
   // then don't directly remove the table from the Kudu catalog. Instead, delete
@@ -2369,8 +2372,10 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
           PartitionPB partition_pb;
           partition.ToPB(&partition_pb);
-          optional<string> dimension_label = step.add_range_partition().has_dimension_label() ?
-              make_optional<string>(step.add_range_partition().dimension_label()) : none;
+          const optional<string> dimension_label =
+              step.add_range_partition().has_dimension_label()
+              ? boost::make_optional(step.add_range_partition().dimension_label())
+              : none;
           new_tablets.emplace(lower_bound,
                               CreateTabletInfo(table, partition_pb, dimension_label));
         }
@@ -2444,8 +2449,10 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
   LOG(INFO) << Substitute("Servicing AlterTable request from $0:\n$1",
                           RequestorString(rpc), SecureShortDebugString(req));
 
-  optional<const string&> user = rpc ?
-      make_optional<const string&>(rpc->remote_user().username()) : none;
+  optional<const string&> user;
+  if (rpc) {
+    user = rpc->remote_user().username();
+  }
 
   // If the HMS integration is enabled, the alteration includes a table
   // rename and the table should be altered in the HMS, then don't directly
@@ -4631,8 +4638,9 @@ void CatalogManager::HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>&
 
   const PersistentTabletInfo& old_info = tablet->metadata().state();
 
-  optional<string> dimension_label = old_info.pb.has_dimension_label() ?
-      make_optional<string>(old_info.pb.dimension_label()) : none;
+  const optional<string> dimension_label = old_info.pb.has_dimension_label()
+      ? boost::make_optional(old_info.pb.dimension_label())
+      : none;
   // The "tablet creation" was already sent, but we didn't receive an answer
   // within the timeout. So the tablet will be replaced by a new one.
   scoped_refptr<TabletInfo> replacement = CreateTabletInfo(tablet->table(),
