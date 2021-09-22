@@ -6536,11 +6536,13 @@ void TableInfo::UpdateMetrics(const string& tablet_id,
       metrics_->DeleteTabletNoLiveRowCount(tablet_id);
       if (metrics_->TableSupportsLiveRowCount()) {
         uint64_t live_row_count = new_stats.live_row_count();
+        LOG(INFO) << "current tablet id is: " << tablet_id;
         {
           std::lock_guard<rw_spinlock> l(lock_);
           for (const auto& e : tablet_map_) {
             if (e.first != tablet_id) {
               live_row_count += e.second->GetStats().live_row_count();
+              LOG(INFO) << "add live row count of tablet: " << e.second->id();
             }
           }
         }

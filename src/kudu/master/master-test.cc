@@ -2432,6 +2432,9 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
   }
   vector<scoped_refptr<TabletInfo>> tablets;
   tables[0]->GetAllTablets(&tablets);
+  LOG(INFO) << "tablet size is: " << tablets.size();
+  ASSERT_EQ(0, tables[0]->GetMetrics()->on_disk_size->value());
+  ASSERT_EQ(0, tables[0]->GetMetrics()->live_row_count->value());
 
   const auto call_update_metrics = [&] (
       scoped_refptr<TabletInfo>& tablet,
@@ -2444,6 +2447,7 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
       new_stats.set_live_row_count(1);
     }
     tables[0]->UpdateMetrics(tablet->id(), old_stats, new_stats);
+    tablet->UpdateStats(new_stats);
   };
 
   // Trigger to cause 'live_row_count' invisible.
@@ -2464,6 +2468,8 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
     ASSERT_STR_CONTAINS(raw, kTableName);
     ASSERT_STR_CONTAINS(raw, "on_disk_size");
     ASSERT_STR_NOT_CONTAINS(raw, "live_row_count");
+    ASSERT_EQ(300, tables[0]->GetMetrics()->on_disk_size->value());
+    ASSERT_EQ(0, tables[0]->GetMetrics()->live_row_count->value());
   }
 
   // Trigger to cause 'live_row_count' visible.
@@ -2483,6 +2489,45 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
     ASSERT_STR_CONTAINS(raw, kTableName);
     ASSERT_STR_CONTAINS(raw, "on_disk_size");
     ASSERT_STR_CONTAINS(raw, "live_row_count");
+    ASSERT_EQ(3, tables[0]->GetMetrics()->live_row_count->value());
+  }
+
+  {
+    for (int i = 0; i < 100; ++i) {
+      for (int j = 0; j < tablets.size(); ++j) {
+        NO_FATALS(call_update_metrics(tablets[j], (tablets.size() - 1 != j)));
+      }
+    }
+
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?ids=$1",
+                                    mini_master_->bound_http_addr().ToString(),
+                                    tables[0]->id()),
+                         &buf));
+    string raw = buf.ToString();
+    ASSERT_STR_CONTAINS(raw, kTableName);
+    ASSERT_STR_CONTAINS(raw, "on_disk_size");
+    ASSERT_STR_NOT_CONTAINS(raw, "live_row_count");
+  }
+
+  {
+    for (int i = 0; i < 100; ++i) {
+      for (int j = 0; j < tablets.size(); ++j) {
+        NO_FATALS(call_update_metrics(tablets[j], true));
+      }
+    }
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?ids=$1",
+                                    mini_master_->bound_http_addr().ToString(),
+                                    tables[0]->id()),
+                         &buf));
+    string raw = buf.ToString();
+    ASSERT_STR_CONTAINS(raw, kTableName);
+    ASSERT_STR_CONTAINS(raw, "on_disk_size");
+    ASSERT_STR_CONTAINS(raw, "live_row_count");
+    ASSERT_EQ(3, tables[0]->GetMetrics()->live_row_count->value());
   }
 }
 
