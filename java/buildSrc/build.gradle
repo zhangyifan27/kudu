@@ -23,6 +23,7 @@ repositories {
   maven { url "https://clojars.org/repo" } // Only used for the clojure plugin below.
   maven { url "https://repo.spring.io/plugins-release" } // Only used for the propdeps plugin below.
   maven { url "https://plugins.gradle.org/m2/" }
+  maven { url "https://mirrors.tencent.com/nexus/repository/maven-public/" }
 }
 
 // Manage plugin dependencies since the plugin block can't be used in included build scripts yet.
