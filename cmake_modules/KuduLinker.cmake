@@ -112,6 +112,7 @@ function(GET_LINKER_VERSION)
   else()
     set(ld_version_flag "--version")
   endif()
+  set(CMAKE_CXX_COMPILER "/usr/bin/c++")
   execute_process(
     COMMAND ${CMAKE_CXX_COMPILER} "-Wl,${ld_version_flag}" ${ARGN}
     ERROR_VARIABLE LINKER_STDERR
