@@ -77,6 +77,10 @@ typedef struct x509_st X509;
 #define SCOPED_OPENSSL_NO_PENDING_ERRORS \
   kudu::security::internal::ScopedCheckNoPendingSSLErrors _no_ssl_errors(__PRETTY_FUNCTION__)
 
+// FIPS_mode() was removed from openssl3.0,
+// see https://wiki.openssl.org/index.php/OpenSSL_3.0 for details.
+#define FIPS_mode() false
+
 namespace kudu {
 namespace security {
 

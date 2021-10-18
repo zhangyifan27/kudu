@@ -18,6 +18,8 @@
 // This file contains the dependencies required for the gradle build itself.
 
 repositories {
+  maven { url 'https://maven.aliyun.com/repository/public/' }
+  maven { url 'https://maven.aliyun.com/repository/spring/'}
   mavenCentral()
   jcenter()
   maven { url "https://clojars.org/repo" } // Only used for the clojure plugin below.
