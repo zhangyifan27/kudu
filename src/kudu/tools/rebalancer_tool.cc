@@ -107,6 +107,10 @@ Status RebalancerTool::PrintStats(ostream& out) {
     return Status::OK();
   }
 
+  if (ci.blacklist_tservers.size() != config_.blacklist_tservers.size()) {
+    return Status::InvalidArgument("invalid blacklist tservers.");
+  }
+
   // Print information about replica count of blacklist tservers.
   RETURN_NOT_OK(PrintBlacklistTserversStats(ci, out));
 

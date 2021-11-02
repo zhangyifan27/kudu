@@ -444,8 +444,9 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
   auto& blacklist_tservers_info = result_info.blacklist_tservers;
   for (const auto& blacklist_tserver : config_.blacklist_tservers) {
     if (!ContainsKey(tserver_replicas_count, blacklist_tserver)) {
-      return Status::InvalidArgument(Substitute(
-          "blacklist tserver $0 is not reported among known tservers", blacklist_tserver));
+      LOG(WARNING) << Substitute(
+          "blacklist tserver $0 is not reported among known tservers in the location", blacklist_tserver);
+      continue;
     }
     ReplicaCountByTable replica_count_by_table;
     for (const auto& elem : table_replicas_info) {
