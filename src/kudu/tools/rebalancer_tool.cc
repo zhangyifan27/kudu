@@ -110,6 +110,7 @@ Status RebalancerTool::PrintStats(ostream& out) {
   if (ci.blacklist_tservers.size() != config_.blacklist_tservers.size()) {
     return Status::InvalidArgument("invalid blacklist tservers.");
   }
+  RETURN_NOT_OK(CheckRemovingTserversIsSafe(raw_info, ci));
 
   // Print information about replica count of blacklist tservers.
   RETURN_NOT_OK(PrintBlacklistTserversStats(ci, out));
@@ -975,7 +976,6 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
   ClusterInfo cluster_info;
   RETURN_NOT_OK(rebalancer_->BuildClusterInfo(
       raw_info, scheduled_moves_, &cluster_info));
-  RETURN_NOT_OK(rebalancer_->CheckRemovingTserversIsSafe(raw_info, cluster_info));
   RETURN_NOT_OK(algorithm()->MoveReplicasFromTservers(&cluster_info,
                                                       max_moves_per_server_ * 5,
                                                       &moves));
