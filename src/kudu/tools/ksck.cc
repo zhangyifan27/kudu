@@ -978,7 +978,7 @@ HealthCheckResult Ksck::VerifyTablet(const shared_ptr<KsckTablet>& tablet,
                         tablet_str,
                         Color(AnsiCode::YELLOW, "under-replicated"),
                         num_voters - running_voters_count);
-  } else if (check_replica_count_ && num_voters < table_num_replicas) {
+  } else if (check_replica_count_ && num_voters != table_num_replicas) {
     result = HealthCheckResult::UNDER_REPLICATED;
     status = Substitute("$0 is $1: configuration has $2 replicas vs desired $3",
                         tablet_str,
