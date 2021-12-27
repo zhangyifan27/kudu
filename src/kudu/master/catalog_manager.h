@@ -767,7 +767,10 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // the catalog manager is not yet running. Caller must hold leader_lock_.
   //
   // NOTE: This should only be used by tests or web-ui
-  Status GetAllTables(std::vector<scoped_refptr<TableInfo>>* tables);
+  void GetAllTables(std::vector<scoped_refptr<TableInfo>>* tables);
+
+  // Only for tests.
+  void GetAllTablets(std::vector<scoped_refptr<TabletInfo>>* tablets);
 
   // Check if a table exists by name, setting 'exist' appropriately. May fail
   // if the catalog manager is not yet running. Caller must hold leader_lock_.
@@ -1037,6 +1040,9 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Extract the set of tablets that must be processed because not running yet.
   void ExtractTabletsToProcess(std::vector<scoped_refptr<TabletInfo>>* tablets_to_process);
 
+  void ExtractDeletedTablesAndTablets(std::vector<scoped_refptr<TableInfo>>* tables_to_delete,
+                                      std::vector<scoped_refptr<TabletInfo>>* tablets_to_delete);
+
   // Check if it's time to generate a new Token Signing Key for TokenSigner.
   // If so, generate one and persist it into the system table. After that,
   // push it into the TokenSigner's key queue.
@@ -1127,6 +1133,12 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                                const std::string& deletion_msg);
 
   void ResetTableLocationsCache();
+
+  Status ProcessDeletedTables(const std::vector<scoped_refptr<TableInfo>>& tables);
+  Status ProcessDeletedTablets(const std::vector<scoped_refptr<TabletInfo>>& tablets);
+
+  Status ProcessDeletedTablesAndTablets(const std::vector<scoped_refptr<TableInfo>>& tables,
+                                        const std::vector<scoped_refptr<TabletInfo>>& tablets);
 
   std::string GenerateId() { return oid_generator_.Next(); }
 

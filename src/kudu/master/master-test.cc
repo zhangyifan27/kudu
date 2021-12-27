@@ -120,13 +120,16 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
+DECLARE_bool(enable_deleted_tables_and_tablets_cleanup);
 DECLARE_bool(enable_per_range_hash_schemas);
 DECLARE_bool(master_client_location_assignment_enabled);
 DECLARE_bool(master_support_authz_tokens);
 DECLARE_bool(mock_table_metrics_for_testing);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_double(sys_catalog_fail_during_write);
+DECLARE_int32(catalog_manager_bg_task_wait_ms);
 DECLARE_int32(default_num_replicas);
+DECLARE_int32(deleted_table_and_tablet_reserved_secs);
 DECLARE_int32(diagnostics_log_stack_traces_interval_ms);
 DECLARE_int32(flush_threshold_mb);
 DECLARE_int32(flush_threshold_secs);
@@ -2397,7 +2400,7 @@ TEST_F(MasterTest, TestDuplicateRequest) {
   vector<scoped_refptr<TableInfo>> tables;
   {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
-    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    NO_FATALS(master_->catalog_manager()->GetAllTables(&tables));
     ASSERT_EQ(1, tables.size());
   }
 
@@ -2472,7 +2475,7 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
   vector<scoped_refptr<TableInfo>> tables;
   {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
-    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    NO_FATALS(master_->catalog_manager()->GetAllTables(&tables));
     ASSERT_EQ(1, tables.size());
   }
   vector<scoped_refptr<TabletInfo>> tablets;
@@ -2539,7 +2542,7 @@ TEST_F(MasterTest, TestTableStatisticsWithOldVersion) {
   vector<scoped_refptr<TableInfo>> tables;
   {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
-    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    NO_FATALS(master_->catalog_manager()->GetAllTables(&tables));
     ASSERT_EQ(1, tables.size());
   }
   const auto& table = tables[0];
@@ -2562,6 +2565,79 @@ TEST_F(MasterTest, TestTableStatisticsWithOldVersion) {
     ASSERT_TRUE(table->GetMetrics()->TableSupportsLiveRowCount());
     ASSERT_EQ(1024, table->GetMetrics()->on_disk_size->value());
     ASSERT_EQ(1000, table->GetMetrics()->live_row_count->value());
+  }
+}
+
+TEST_F(MasterTest, TestDeletedTablesAndTabletsCleanup) {
+  FLAGS_enable_deleted_tables_and_tablets_cleanup = true;
+  FLAGS_deleted_table_and_tablet_reserved_secs = 1;
+  FLAGS_catalog_manager_bg_task_wait_ms = 10;
+
+  const char* kTableName = "testtable";
+  const Schema kTableSchema({ColumnSchema("key", INT32)}, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  vector<scoped_refptr<TableInfo>> tables;
+  vector<scoped_refptr<TabletInfo>> tablets;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    NO_FATALS(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(1, tables.size());
+    NO_FATALS(master_->catalog_manager()->GetAllTablets(&tablets));
+    ASSERT_EQ(3, tablets.size());
+  }
+
+  // Replace a tablet.
+  {
+    const string& tablet_id = tablets[0]->id();
+    ReplaceTabletRequestPB req;
+    ReplaceTabletResponsePB resp;
+    req.set_tablet_id(tablet_id);
+    RpcController controller;
+    ASSERT_OK(proxy_->ReplaceTablet(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // The replaced tablet would be cleaned up if expired.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    NO_FATALS(master_->catalog_manager()->GetAllTablets(&tablets));
+    ASSERT_EQ(4, tablets.size());
+  }
+  SleepFor(MonoDelta::FromSeconds(FLAGS_deleted_table_and_tablet_reserved_secs + 1));
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    NO_FATALS(master_->catalog_manager()->GetAllTablets(&tablets));
+    ASSERT_EQ(3, tablets.size());
+  }
+
+  // Delete the table.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(kTableName);
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // The deleted table and tablets would be cleaned up if expired.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    NO_FATALS(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(1, tables.size());
+    NO_FATALS(master_->catalog_manager()->GetAllTablets(&tablets));
+    ASSERT_EQ(3, tablets.size());
+  }
+  SleepFor(MonoDelta::FromSeconds(FLAGS_deleted_table_and_tablet_reserved_secs + 1));
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    NO_FATALS(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(0, tables.size());
+    NO_FATALS(master_->catalog_manager()->GetAllTablets(&tablets));
+    ASSERT_EQ(0, tablets.size());
   }
 }
 
