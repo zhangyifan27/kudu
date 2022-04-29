@@ -1690,6 +1690,8 @@ Status Tablet::PickRowSetsToCompact(RowSetsInCompaction *picked,
                                                   &quality,
                                                   /*log=*/nullptr));
     VLOG_WITH_PREFIX(2) << "Compaction quality: " << quality;
+    LOG(INFO) << "Compaction quality: " << quality;
+    LOG(INFO) << "Picked RowSet size: " << picked_set.size();
   }
 
   shared_lock<rw_spinlock> l(component_lock_);
@@ -2174,6 +2176,10 @@ void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
   }
 
   VLOG_WITH_PREFIX(1) << "Best compaction for " << tablet_id() << ": " << quality;
+  if (quality > 0) {
+    LOG(INFO) << "Compaction quality: " << quality;
+    LOG(INFO) << "Picked RowSet size: " << picked_set_ignored.size();
+  }
 
   stats->set_runnable(quality >= 0);
   stats->set_perf_improvement(quality);

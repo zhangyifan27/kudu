@@ -462,6 +462,7 @@ Status BudgetedCompactionPolicy::PickRowSets(
   //    solution found.
   vector<double> best_upper_bounds;
   RunApproximation(asc_min_key, asc_max_key, &best_upper_bounds, &best_solution);
+  LOG(INFO) << "first quality is: " << best_solution.value;
 
   // If the best solution found above is less than some tiny threshold, we don't
   // bother searching for the exact solution, since it can have value at most
@@ -482,6 +483,7 @@ Status BudgetedCompactionPolicy::PickRowSets(
   // better than our current best solution, we use the exact knapsack solver to
   // find the improved solution.
   RunExact(asc_min_key, asc_max_key, best_upper_bounds, &best_solution);
+  LOG(INFO) << "second quality is: " << best_solution.value;
 
   // Log the input and output of the selection.
   if (VLOG_IS_ON(1) || log != nullptr) {

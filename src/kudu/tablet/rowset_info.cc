@@ -292,6 +292,7 @@ void RowSetInfo::ComputeCdfAndCollectOrdered(const RowSetTree& tree,
       available_rowsets.push_back(rs);
     }
   }
+  LOG(INFO) << "Available rowset size : " << available_rowsets.size();
 
   size_t len = available_rowsets.size();
   vector<RowSetInfo> info_by_min_key_tmp;
