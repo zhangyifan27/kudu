@@ -3831,14 +3831,17 @@ class PickLeaderReplica : public TSPicker {
 //
 // The target tablet server is refreshed before each RPC by consulting the provided
 // TSPicker implementation.
+// Each created RetryingTSRpcTask should be added to TableInfo::pending_tasks_ by
+// calling TableInfo::AddTask(), so 'table' must remain valid for the lifetime of
+// this class.
 class RetryingTSRpcTask : public MonitoredTask {
  public:
-  RetryingTSRpcTask(Master *master,
+  RetryingTSRpcTask(Master* master,
                     unique_ptr<TSPicker> replica_picker,
-                    scoped_refptr<TableInfo> table)
+                    TableInfo* table)
     : master_(master),
       replica_picker_(std::move(replica_picker)),
-      table_(std::move(table)),
+      table_(table),
       start_ts_(MonoTime::Now()),
       deadline_(start_ts_ + MonoDelta::FromMilliseconds(FLAGS_unresponsive_ts_rpc_timeout_ms)),
       attempt_(0),
@@ -3862,7 +3865,7 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   MonoTime start_timestamp() const override { return start_ts_; }
   MonoTime completion_timestamp() const override { return end_ts_; }
-  const scoped_refptr<TableInfo>& table() const { return table_ ; }
+  TableInfo* table() const { return table_; }
 
  protected:
   // Send an RPC request and register a callback.
@@ -3905,7 +3908,8 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   Master * const master_;
   const unique_ptr<TSPicker> replica_picker_;
-  const scoped_refptr<TableInfo> table_;
+  // RetryingTSRpcTask is owned by 'TableInfo', so the backpointer should be raw.
+  TableInfo* table_;
 
   MonoTime start_ts_;
   MonoTime end_ts_;
@@ -4077,7 +4081,7 @@ class RetrySpecificTSRpcTask : public RetryingTSRpcTask {
  public:
   RetrySpecificTSRpcTask(Master* master,
                          const string& permanent_uuid,
-                         const scoped_refptr<TableInfo>& table)
+                         TableInfo* table)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickSpecificUUID(permanent_uuid)),
                         table),
@@ -4099,7 +4103,7 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
                      const string& permanent_uuid,
                      const scoped_refptr<TabletInfo>& tablet,
                      const TabletMetadataLock& tablet_lock)
-    : RetrySpecificTSRpcTask(master, permanent_uuid, tablet->table()),
+    : RetrySpecificTSRpcTask(master, permanent_uuid, tablet->table().get()),
       tablet_id_(tablet->id()) {
     deadline_ = start_ts_ + MonoDelta::FromMilliseconds(FLAGS_tablet_creation_timeout_ms);
 
@@ -4165,17 +4169,17 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
 // Send a DeleteTablet() RPC request.
 class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
  public:
-  AsyncDeleteReplica(
-      Master* master, const string& permanent_uuid,
-      const scoped_refptr<TableInfo>& table, string tablet_id,
-      TabletDataState delete_type,
-      optional<int64_t> cas_config_opid_index_less_or_equal,
-      string reason)
+  AsyncDeleteReplica(Master* master,
+                     const string& permanent_uuid,
+                     TableInfo* table,
+                     string tablet_id,
+                     TabletDataState delete_type,
+                     optional<int64_t> cas_config_opid_index_less_or_equal,
+                     string reason)
       : RetrySpecificTSRpcTask(master, permanent_uuid, table),
         tablet_id_(std::move(tablet_id)),
         delete_type_(delete_type),
-        cas_config_opid_index_less_or_equal_(
-            std::move(cas_config_opid_index_less_or_equal)),
+        cas_config_opid_index_less_or_equal_(std::move(cas_config_opid_index_less_or_equal)),
         reason_(std::move(reason)) {}
 
   string type_name() const override {
@@ -4280,7 +4284,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
                   scoped_refptr<TabletInfo> tablet)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
-                        tablet->table()),
+                        tablet->table().get()),
       tablet_(std::move(tablet)) {
   }
 
@@ -4380,7 +4384,7 @@ AsyncChangeConfigTask::AsyncChangeConfigTask(Master* master,
                                              consensus::ChangeConfigType change_config_type)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
-                        tablet->table()),
+                        tablet->table().get()),
       tablet_(std::move(tablet)),
       cstate_(std::move(cstate)),
       change_config_type_(change_config_type) {
@@ -4745,7 +4749,7 @@ Status CatalogManager::ProcessTabletReport(
       // TODO(unknown): Cancel tablet creation, instead of deleting, in cases
       // where that might be possible (tablet creation timeout & replacement).
       rpcs.emplace_back(new AsyncDeleteReplica(
-          master_, ts_desc->permanent_uuid(), table, tablet_id,
+          master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
           TABLET_DATA_DELETED, none, msg));
       continue;
     }
@@ -4772,7 +4776,7 @@ Status CatalogManager::ProcessTabletReport(
           "Replica has no consensus available" :
           Substitute("Replica with old config index $0", report_opid_index);
       rpcs.emplace_back(new AsyncDeleteReplica(
-          master_, ts_desc->permanent_uuid(), table, tablet_id,
+          master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
           TABLET_DATA_TOMBSTONED, prev_opid_index,
           Substitute("$0 (current committed config index is $1)",
                      delete_msg, prev_opid_index)));
@@ -4895,7 +4899,7 @@ Status CatalogManager::ProcessTabletReport(
             const string& peer_uuid = p.permanent_uuid();
             if (!ContainsKey(current_member_uuids, peer_uuid)) {
               rpcs.emplace_back(new AsyncDeleteReplica(
-                  master_, peer_uuid, table, tablet_id,
+                  master_, peer_uuid, table.get(), tablet_id,
                   TABLET_DATA_TOMBSTONED, prev_cstate.committed_config().opid_index(),
                   Substitute("TS $0 not found in new config with opid_index $1",
                              peer_uuid, cstate.committed_config().opid_index())));
@@ -5152,7 +5156,7 @@ void CatalogManager::SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& ta
       << " replicas of tablet " << tablet->id();
   for (const auto& peer : cstate.committed_config().peers()) {
     scoped_refptr<AsyncDeleteReplica> task = new AsyncDeleteReplica(
-        master_, peer.permanent_uuid(), tablet->table(), tablet->id(),
+        master_, peer.permanent_uuid(), tablet->table().get(), tablet->id(),
         TABLET_DATA_DELETED, none, deletion_msg);
     tablet->table()->AddTask(tablet->id(), task);
     WARN_NOT_OK(task->Run(), Substitute(
@@ -6499,6 +6503,9 @@ void PersistentTabletInfo::set_state(SysTabletsEntryPB::State state, const strin
 TableInfo::TableInfo(string table_id) : table_id_(std::move(table_id)) {}
 
 TableInfo::~TableInfo() {
+  // Abort and wait for all pending tasks completed.
+  AbortTasks();
+  WaitTasksCompletion();
 }
 
 string TableInfo::ToString() const {
