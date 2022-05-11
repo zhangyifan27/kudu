@@ -255,7 +255,8 @@ void RowSetInfo::ComputeCdfAndCollectOrdered(const RowSetTree& tree,
                                              double* rowset_total_height,
                                              double* rowset_total_width,
                                              vector<RowSetInfo>* info_by_min_key,
-                                             vector<RowSetInfo>* info_by_max_key) {
+                                             vector<RowSetInfo>* info_by_max_key,
+                                             string tablet_id) {
   DCHECK((info_by_min_key && info_by_max_key) ||
          (!info_by_min_key && !info_by_max_key))
       << "'info_by_min_key' and 'info_by_max_key' must both be non-null or both be null";
@@ -292,7 +293,9 @@ void RowSetInfo::ComputeCdfAndCollectOrdered(const RowSetTree& tree,
       available_rowsets.push_back(rs);
     }
   }
-  LOG(INFO) << "Available rowset size : " << available_rowsets.size();
+  if (tablet_id != "") {
+    LOG(INFO) << tablet_id << " Available rowset size : " << available_rowsets.size();
+  }
 
   size_t len = available_rowsets.size();
   vector<RowSetInfo> info_by_min_key_tmp;

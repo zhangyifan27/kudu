@@ -91,8 +91,8 @@ static const double kSupportAdjust = 1.003;
 // BudgetedCompactionPolicy
 ////////////////////////////////////////////////////////////
 
-BudgetedCompactionPolicy::BudgetedCompactionPolicy(int budget)
-  : size_budget_mb_(budget) {
+BudgetedCompactionPolicy::BudgetedCompactionPolicy(int budget, std::string tablet_id)
+    : size_budget_mb_(budget), tablet_id_(tablet_id) {
   CHECK_GT(budget, 0);
 }
 
@@ -109,7 +109,8 @@ void BudgetedCompactionPolicy::SetupKnapsackInput(
                                           /*rowset_total_height=*/nullptr,
                                           /*rowset_total_width=*/nullptr,
                                           asc_min_key,
-                                          asc_max_key);
+                                          asc_max_key,
+                                          tablet_id_);
 
   if (asc_min_key->size() < 2) {
     // There must be at least two rowsets to compact.
@@ -404,6 +405,7 @@ Status BudgetedCompactionPolicy::PickRowSets(
   if (asc_max_key.empty()) {
     if (log) {
       LOG_STRING(INFO, log) << "No rowsets to compact";
+      LOG(INFO) << "No rowsets to compact";
     }
     *quality = 0.0;
     return Status::OK();
@@ -462,7 +464,7 @@ Status BudgetedCompactionPolicy::PickRowSets(
   //    solution found.
   vector<double> best_upper_bounds;
   RunApproximation(asc_min_key, asc_max_key, &best_upper_bounds, &best_solution);
-  LOG(INFO) << "first quality is: " << best_solution.value;
+  LOG(INFO) << tablet_id_ << " first quality is: " << best_solution.value;
 
   // If the best solution found above is less than some tiny threshold, we don't
   // bother searching for the exact solution, since it can have value at most
@@ -483,7 +485,7 @@ Status BudgetedCompactionPolicy::PickRowSets(
   // better than our current best solution, we use the exact knapsack solver to
   // find the improved solution.
   RunExact(asc_min_key, asc_max_key, best_upper_bounds, &best_solution);
-  LOG(INFO) << "second quality is: " << best_solution.value;
+  LOG(INFO) << tablet_id_ << " second quality is: " << best_solution.value;
 
   // Log the input and output of the selection.
   if (VLOG_IS_ON(1) || log != nullptr) {

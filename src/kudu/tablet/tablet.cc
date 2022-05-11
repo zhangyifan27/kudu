@@ -238,8 +238,8 @@ struct IteratorStats;
 
 namespace tablet {
 
-static CompactionPolicy *CreateCompactionPolicy() {
-  return new BudgetedCompactionPolicy(FLAGS_tablet_compaction_budget_mb);
+static CompactionPolicy* CreateCompactionPolicy(std::string tablet_id = "") {
+  return new BudgetedCompactionPolicy(FLAGS_tablet_compaction_budget_mb, tablet_id);
 }
 
 ////////////////////////////////////////////////////////////
@@ -278,8 +278,8 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     last_rows_mutated_(0),
     last_read_score_(0.0),
     last_write_score_(0.0) {
-      CHECK(schema()->has_column_ids());
-  compaction_policy_.reset(CreateCompactionPolicy());
+  CHECK(schema()->has_column_ids());
+  compaction_policy_.reset(CreateCompactionPolicy(tablet_id()));
 
   if (metric_registry) {
     MetricEntity::AttributeMap attrs;
@@ -1690,8 +1690,8 @@ Status Tablet::PickRowSetsToCompact(RowSetsInCompaction *picked,
                                                   &quality,
                                                   /*log=*/nullptr));
     VLOG_WITH_PREFIX(2) << "Compaction quality: " << quality;
-    LOG(INFO) << "Compaction quality: " << quality;
-    LOG(INFO) << "Picked RowSet size: " << picked_set.size();
+    LOG_WITH_PREFIX(INFO) << "[PickRowSetsToCompact] Compaction quality: " << quality;
+    LOG_WITH_PREFIX(INFO) << "[PickRowSetsToCompact] Picked RowSet size: " << picked_set.size();
   }
 
   shared_lock<rw_spinlock> l(component_lock_);
@@ -2177,8 +2177,9 @@ void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
 
   VLOG_WITH_PREFIX(1) << "Best compaction for " << tablet_id() << ": " << quality;
   if (quality > 0) {
-    LOG(INFO) << "Compaction quality: " << quality;
-    LOG(INFO) << "Picked RowSet size: " << picked_set_ignored.size();
+    LOG_WITH_PREFIX(INFO) << "[UpdateCompactionStats] Compaction quality: " << quality;
+    LOG_WITH_PREFIX(INFO) << "[UpdateCompactionStats] Picked RowSet size: "
+                          << picked_set_ignored.size();
   }
 
   stats->set_runnable(quality >= 0);

@@ -77,7 +77,7 @@ class CompactionPolicy {
 // See docs/design-docs/compaction-policy.md for details.
 class BudgetedCompactionPolicy : public CompactionPolicy {
  public:
-  explicit BudgetedCompactionPolicy(int size_budget_mb);
+  explicit BudgetedCompactionPolicy(int size_budget_mb, std::string tablet_id = "");
 
   Status PickRowSets(const RowSetTree &tree,
                      CompactionSelection* picked,
@@ -125,6 +125,8 @@ class BudgetedCompactionPolicy : public CompactionPolicy {
                 SolutionAndValue* best_solution) const;
 
   const size_t size_budget_mb_;
+
+  const std::string tablet_id_;
 };
 
 } // namespace tablet

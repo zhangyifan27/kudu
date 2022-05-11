@@ -58,7 +58,8 @@ class RowSetInfo {
                                           double* rowset_total_height,
                                           double* rowset_total_width,
                                           std::vector<RowSetInfo>* info_by_min_key,
-                                          std::vector<RowSetInfo>* info_by_max_key);
+                                          std::vector<RowSetInfo>* info_by_max_key,
+                                          std::string tablet_id = "");
 
   // Split [start_key, stop_key) into primary key ranges by chunk size.
   //
