@@ -1149,6 +1149,7 @@ build_jwt_cpp() {
     -DCMAKE_BUILD_TYPE=release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
     -DJWT_BUILD_EXAMPLES=OFF \
+    -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@1.1 \
     $JWT_CPP_SOURCE
   make -j$PARALLEL install
   popd
