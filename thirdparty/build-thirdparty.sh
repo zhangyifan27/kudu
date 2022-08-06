@@ -179,7 +179,7 @@ elif [[ "$OSTYPE" == "darwin"* ]]; then
   # the Kudu build.
   if ! OPENSSL_CFLAGS=$(pkg-config --cflags openssl); then
     # If OpenSSL is built via Homebrew, pkg-config does not report on cflags.
-    homebrew_openssl_dirs=(/usr/local/opt/openssl@1.1 /opt/homebrew/opt/openssl@1.1)
+    homebrew_openssl_dirs=(/usr/local/opt/openssl /usr/local/opt/openssl@3 /opt/homebrew/opt/openssl@1.1)
     for homebrew_openssl_dir in "${homebrew_openssl_dirs[@]}"; do
       if [ -d $homebrew_openssl_dir ]; then
         OPENSSL_CFLAGS="-I$homebrew_openssl_dir/include"

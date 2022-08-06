@@ -139,7 +139,7 @@ def check_openssl():
     cflags.append(openssl_include)
   else:
     homebrew_openssl_dirs = [
-        "/usr/local/opt/openssl@1.1/include", "/opt/homebrew/opt/openssl@1.1/include"]
+        "/usr/local/opt/openssl/include", "/usr/local/opt/openssl@3/include", "/opt/homebrew/opt/openssl@1.1/include"]
     for homebrew_openssl_dir in homebrew_openssl_dirs:
       if os.path.isdir(homebrew_openssl_dir):
         cflags.append("-I" + homebrew_openssl_dir)
