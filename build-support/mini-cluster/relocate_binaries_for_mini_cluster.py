@@ -397,6 +397,8 @@ def relocate_deps_macos(target_src, target_dst, config):
 
     # Archive the rest of the runtime dependencies.
     dep_dst = os.path.join(config[ARTIFACT_LIB_DIR], os.path.basename(dep_src))
+    print(dep_src)
+    print(dep_dst)
     if not os.path.isfile(dep_dst):
       # Recursively copy and relocate library dependencies as they are found.
       copy_file(dep_src, dep_dst)
