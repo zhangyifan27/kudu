@@ -68,6 +68,7 @@
 set -e
 
 SOURCE_ROOT=$(cd $(dirname $0)/../..; pwd)
+echo "$SOURCE_ROOT"
 BUILD_ROOT=$SOURCE_ROOT/build/mini-cluster
 MINI_CLUSTER_SRCDIR=$SOURCE_ROOT/build-support/mini-cluster
 TARGETS="kudu kudu-tserver kudu-master"
@@ -106,7 +107,7 @@ fi
 EXTRA_CMAKE_FLAGS=""
 if [ -n "$MACOS" ]; then
   # TODO(mpercy): Consider using pkg-config to support building with MacPorts.
-  EXTRA_CMAKE_FLAGS="$EXTRA_CMAKE_FLAGS -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl"
+  EXTRA_CMAKE_FLAGS="$EXTRA_CMAKE_FLAGS -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl -DCMAKE_CXX_COMPILER=`which clang++`"
   # TODO(mpercy): Is it even possible to build Kudu with gcc/g++ on macOS?
   export CC=clang
   export CXX=clang++
@@ -144,9 +145,7 @@ fi
 
 # Strip everything to minimize the size of the tarball we generate.
 echo Stripping symbols...
-for file in $ARTIFACT_NAME/bin/*; do
-  strip $file
-done
+find $ARTIFACT_NAME/bin -type f -exec strip {} \;
 
 # Stripping libraries on macOS is tricky, so skip it for now.
 # TODO(mpercy): Deal with detecting signed libraries and indirect symbol table

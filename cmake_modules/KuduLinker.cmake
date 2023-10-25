@@ -167,6 +167,17 @@ function(GET_LINKER_VERSION)
     set(LINKER_FOUND TRUE)
     set(LINKER_FAMILY "ld64")
     set(LINKER_VERSION "${CMAKE_MATCH_1}")
+    elseif (LINKER_STDERR MATCHES "PROJECT:dyld")
+    # dyld outputs the versioning information into stderr.
+    # Sample:
+    #   @(#)PROGRAM:ld  PROJECT:dyld-1015.7
+    if (NOT "${LINKER_STDERR}" MATCHES "PROJECT:dyld-([0-9]+(\\.[0-9]+)?)")
+      message(SEND_ERROR "Could not extract dyld version. "
+        "Linker version output: ${LINKER_STDOUT}")
+    endif()
+    set(LINKER_FOUND TRUE)
+    set(LINKER_FAMILY "dyld")
+    set(LINKER_VERSION "${CMAKE_MATCH_1}")
   else()
     set(LINKER_FOUND FALSE)
   endif()
