@@ -431,7 +431,7 @@ Status CFileSet::Iterator::OptimizePKPredicates(ScanSpec* spec) {
   EncodedKey* implicit_ub_key = nullptr;
   bool modify_lower_bound_key = false;
   bool modify_upper_bound_key = false;
-  const Schema& tablet_schema = *base_data_->tablet_schema();
+  const Schema& tablet_schema = base_data_->tablet_schema();
 
   if (!lb_key || lb_key->encoded_key() < base_data_->min_encoded_key_) {
     RETURN_NOT_OK(EncodedKey::DecodeEncodedString(
