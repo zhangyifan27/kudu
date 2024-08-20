@@ -1146,6 +1146,35 @@ TEST_F(CompositeIntKeysTest, TestLiftPrimaryKeyBounds_UpperBound) {
   }
 }
 
+TEST_F(CompositeIntKeysTest, TestLiftPrimaryKeyBounds) {
+  {
+    // key >= (10, min, min)
+    //      < (11, min, min)
+    ScanSpec spec;
+
+    KuduPartialRow lower_bound(&schema_);
+    CHECK_OK(lower_bound.SetInt8("a", 10));
+    CHECK_OK(lower_bound.SetInt8("b", INT8_MIN));
+    CHECK_OK(lower_bound.SetInt8("c", INT8_MIN));
+
+    KuduPartialRow upper_bound(&schema_);
+    CHECK_OK(upper_bound.SetInt8("a", 11));
+    CHECK_OK(upper_bound.SetInt8("b", INT8_MIN));
+    CHECK_OK(upper_bound.SetInt8("c", INT8_MIN));
+
+    SetLowerBound(&spec, lower_bound);
+    SetExclusiveUpperBound(&spec, upper_bound);
+
+    spec.OptimizeScan(schema_, &arena_, true);
+    // ScanSpec after unification: PK >= (int8 a=10, int8 b=-128, int8 c=-128) AND PK < (int8 a=11,
+    // int8 b=-128, int8 c=-128) AND a = 10 AND b IS NOT NULL ScanSpec after pushing predicates: PK
+    // >= (int8 a=10, int8 b=-128, int8 c=-128) AND PK < (int8 a=11, int8 b=-128, int8 c=-128) AND b
+    // IS NOT NULL
+    // ScanSpec after pruning IS NOT NULL predicates: PK >= (int8 a=10, int8 b=-128, int8 c=-128)
+    // AND PK < (int8 a=11, int8 b=-128, int8 c=-128)
+  }
+}
+
 // Test that implicit constraints specified in the primary key bounds are lifted
 // into the predicates.
 TEST_F(CompositeIntKeysTest, TestLiftPrimaryKeyBounds_BothBounds) {
