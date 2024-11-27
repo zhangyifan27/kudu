@@ -79,6 +79,7 @@ namespace itest {
 static const char* const kTableName = "test-table";
 static const int kNumTabletServers = 3;
 static const int kNumRows = 200;
+static const int kRaftHeartbeatIntervalMs = 10;
 
 class AutoIncrementingItest : public KuduTest {
  public:
@@ -208,7 +209,7 @@ class AutoIncrementingItest : public KuduTest {
         "--flush_threshold_secs=1",
         "--flush_threshold_mb=0",
         "--log_compression_codec=no_compression",
-    };
+        Substitute("--raft_heartbeat_interval_ms=$0", kRaftHeartbeatIntervalMs)};
     opts.num_tablet_servers = kNumTabletServers;
     cluster_.reset(new cluster::ExternalMiniCluster(std::move(opts)));
     RETURN_NOT_OK(cluster_->Start());
@@ -394,7 +395,6 @@ TEST_F(AutoIncrementingItest, BootstrapWithNoWals) {
   }
 }
 
-
 TEST_F(AutoIncrementingItest, BootstrapNoWalsNoData) {
   string tablet_uuid;
   TestSetup(&tablet_uuid);
@@ -439,11 +439,13 @@ TEST_F(AutoIncrementingItest, BootstrapNoWalsNoData) {
   }
 
   // Insert new data and verify auto_incrementing_id starts from 1.
-  ASSERT_OK(InsertData(kNumRows, kNumRows * 2));
+  // Sleep between each write for Raft heartbeat interval to ensure row operations replicated
+  // to all replicas.
+  ASSERT_OK(InsertData(kNumRows, kNumRows * 2, kRaftHeartbeatIntervalMs));
   for (int j = 0; j < kNumTabletServers; j++) {
     vector<string> results;
     ASSERT_OK(ScanTablet(j, tablet_uuid, &results));
-    ASSERT_EQ(200, results.size());
+    ASSERT_EQ(kNumRows, results.size());
     for (int i = 0; i < results.size(); i++) {
       ASSERT_EQ(Substitute("(int32 c0=$0, int64 $1=$2, string c1=\"string_val\")", i + kNumRows,
                            Schema::GetAutoIncrementingColumnName(), i + 1), results[i]);
@@ -503,7 +505,7 @@ TEST_F(AutoIncrementingItest, BootstrapWalsDiverge) {
   // Write 200 rows at the rate of 1 row every 5ms which are sent to the leader replica. After
   // 100ms of starting to insert data, we shutdown the followers and at this point the write
   // request is expected to 900ms more. Since the leader would mark the followers as
-  // unavailable after 3 lost hearbeats (1500ms), there will for sure be a situation where the
+  // unavailable after 3 lost heartbeats (1500ms), there will for sure be a situation where the
   // leader has sent a write op and hasn't gotten the response from majority-1 number of
   // followers. In this case the write op is not marked committed in the leader replica. All
   // the writes including this are considered failed.
