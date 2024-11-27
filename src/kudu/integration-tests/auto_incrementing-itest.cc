@@ -173,6 +173,25 @@ class AutoIncrementingItest : public KuduTest {
     return Status::OK();
   }
 
+  // Scan rows from the above created table with selection mode 'LEADER_ONLY', and store
+  // the stringified rows to results. Rows will be ordered by primary key.
+  Status ScanTable(vector<string>* results) {
+    RETURN_NOT_OK(client_->OpenTable(kTableName, &table_));
+    client::KuduScanner scanner(table_.get());
+    RETURN_NOT_OK(scanner.SetSelection(client::KuduClient::LEADER_ONLY));
+    RETURN_NOT_OK(scanner.SetFaultTolerant());
+    RETURN_NOT_OK(scanner.Open());
+    client::KuduScanBatch batch;
+    while (scanner.HasMoreRows()) {
+      RETURN_NOT_OK(scanner.NextBatch(&batch));
+      for (const auto& row : batch) {
+        results->emplace_back(row.ToString());
+      }
+    }
+    scanner.Close();
+    return Status::OK();
+  }
+
   // Return a scan response from the tablet on the given tablet server.
   Status ScanTablet(int ts, const string& tablet_id, vector<string>* results) {
     ScanResponsePB resp;
@@ -394,7 +413,6 @@ TEST_F(AutoIncrementingItest, BootstrapWithNoWals) {
   }
 }
 
-
 TEST_F(AutoIncrementingItest, BootstrapNoWalsNoData) {
   string tablet_uuid;
   TestSetup(&tablet_uuid);
@@ -437,17 +455,23 @@ TEST_F(AutoIncrementingItest, BootstrapNoWalsNoData) {
     cluster_->tablet_server(i)->Shutdown();
     ASSERT_OK(cluster_->tablet_server(i)->Restart());
   }
+  // Ensure that all of the tablet servers have a running tablet.
+  for (int j = 0; j < kNumTabletServers; j++) {
+    ASSERT_OK(
+        cluster_->WaitForTabletsRunning(cluster_->tablet_server(j), 1, MonoDelta::FromSeconds(60)));
+  }
 
   // Insert new data and verify auto_incrementing_id starts from 1.
   ASSERT_OK(InsertData(kNumRows, kNumRows * 2));
-  for (int j = 0; j < kNumTabletServers; j++) {
-    vector<string> results;
-    ASSERT_OK(ScanTablet(j, tablet_uuid, &results));
-    ASSERT_EQ(200, results.size());
-    for (int i = 0; i < results.size(); i++) {
-      ASSERT_EQ(Substitute("(int32 c0=$0, int64 $1=$2, string c1=\"string_val\")", i + kNumRows,
-                           Schema::GetAutoIncrementingColumnName(), i + 1), results[i]);
-    }
+  vector<string> results;
+  ASSERT_OK(ScanTable(&results));
+  ASSERT_EQ(kNumRows, results.size());
+  for (int i = 0; i < results.size(); i++) {
+    ASSERT_EQ(Substitute("(int32 c0=$0, int64 $1=$2, string c1=\"string_val\")",
+                         i + kNumRows,
+                         Schema::GetAutoIncrementingColumnName(),
+                         i + 1),
+              results[i]);
   }
 }
 
