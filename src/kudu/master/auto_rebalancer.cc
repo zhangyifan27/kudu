@@ -43,6 +43,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
@@ -196,6 +197,7 @@ AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
       FLAGS_auto_rebalancing_enable_range_rebalancing))),
       random_generator_(random_device_()),
       number_of_loop_iterations_for_test_(0),
+      moves_attempted_this_round_for_test_(0),
       moves_scheduled_this_round_for_test_(0) {
 }
 
@@ -242,6 +244,7 @@ void AutoRebalancerTask::RunLoop() {
     {
       CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
       if (!l.first_failed_status().ok()) {
+        moves_attempted_this_round_for_test_ = 0;
         moves_scheduled_this_round_for_test_ = 0;
         continue;
       }
@@ -281,8 +284,13 @@ void AutoRebalancerTask::RunLoop() {
                                  s.ToString());
       continue;
     }
-    WARN_NOT_OK(ExecuteMoves(replica_moves),
-                "failed to send replica move request");
+    moves_attempted_this_round_for_test_ = replica_moves.size();
+    // Set to -1 as a sentinel while ExecuteMoves() is in progress, so that
+    // test assertions reading both counters cannot observe a stale
+    // moves_scheduled value from a prior round alongside the new
+    // moves_attempted value.
+    moves_scheduled_this_round_for_test_ = -1;
+    ExecuteMoves(&replica_moves);
     moves_scheduled_this_round_for_test_ = replica_moves.size();
 
     // Wait for all of the moves from this iteration to complete.
@@ -475,77 +483,92 @@ Status AutoRebalancerTask::GetTabletLeader(
   return Status::NotFound(Substitute("Couldn't find leader for tablet $0", tablet_id));
 }
 
-// TODO(hannah.nguyen): remove moves that fail to be scheduled from
-// 'replica_moves'.
-Status AutoRebalancerTask::ExecuteMoves(
-    const vector<Rebalancer::ReplicaMove>& replica_moves) {
-  for (const auto& move_info : replica_moves) {
+void AutoRebalancerTask::ExecuteMoves(
+    vector<Rebalancer::ReplicaMove>* replica_moves) {
+  vector<int> failed_indices;
+
+  for (int i = 0; i < static_cast<int>(replica_moves->size()); ++i) {
+    const auto& move_info = (*replica_moves)[i];
     const auto& tablet_id = move_info.tablet_uuid;
     const auto& src_ts_uuid = move_info.ts_uuid_from;
     const auto& dst_ts_uuid = move_info.ts_uuid_to;
-    string leader_uuid;
-    HostPort leader_hp;
-    RETURN_NOT_OK(GetTabletLeader(tablet_id, &leader_uuid, &leader_hp));
-    shared_ptr<TSDescriptor> leader_desc;
-    if (!ts_manager_->LookupTSByUUID(leader_uuid, &leader_desc)) {
-      return Status::NotFound(
-          Substitute("Couldn't find leader replica's tserver $0", leader_uuid));
-    }
-    // Mark the replica to be replaced.
-    BulkChangeConfigRequestPB req;
-    auto* modify_peer = req.add_config_changes();
-    modify_peer->set_type(MODIFY_PEER);
-    *modify_peer->mutable_peer()->mutable_permanent_uuid() = src_ts_uuid;
-    modify_peer->mutable_peer()->mutable_attrs()->set_replace(true);
 
-    // NOTE: 'dst_ts_uuid' is empty if the move was scheduled to fix location
-    // policy violations.
-    if (!dst_ts_uuid.empty()) {
-      // Verify that the destination tserver exists.
-      shared_ptr<TSDescriptor> dest_desc;
-      if (!ts_manager_->LookupTSByUUID(dst_ts_uuid, &dest_desc)) {
-        return Status::NotFound("Could not find destination tserver");
+    // Attempt to schedule this move. On any failure, log a warning and skip
+    // this move so the remaining moves are still attempted.
+    Status s = [&]() -> Status {
+      string leader_uuid;
+      HostPort leader_hp;
+      RETURN_NOT_OK(GetTabletLeader(tablet_id, &leader_uuid, &leader_hp));
+      shared_ptr<TSDescriptor> leader_desc;
+      if (!ts_manager_->LookupTSByUUID(leader_uuid, &leader_desc)) {
+        return Status::NotFound(
+            Substitute("Couldn't find leader replica's tserver $0", leader_uuid));
       }
-      ServerRegistrationPB dest_reg;
-      RETURN_NOT_OK(dest_desc->GetRegistration(&dest_reg));
+      // Mark the replica to be replaced.
+      BulkChangeConfigRequestPB req;
+      auto* modify_peer = req.add_config_changes();
+      modify_peer->set_type(MODIFY_PEER);
+      *modify_peer->mutable_peer()->mutable_permanent_uuid() = src_ts_uuid;
+      modify_peer->mutable_peer()->mutable_attrs()->set_replace(true);
 
-      auto* add_peer_change = req.add_config_changes();
-      add_peer_change->set_type(ADD_PEER);
-      auto* new_peer = add_peer_change->mutable_peer();
-      new_peer->set_permanent_uuid(dst_ts_uuid);
-      new_peer->set_member_type(RaftPeerPB::NON_VOTER);
-      new_peer->mutable_attrs()->set_promote(true);
-      *new_peer->mutable_last_known_addr() = dest_reg.rpc_addresses(0);
+      // NOTE: 'dst_ts_uuid' is empty if the move was scheduled to fix location
+      // policy violations.
+      if (!dst_ts_uuid.empty()) {
+        shared_ptr<TSDescriptor> dest_desc;
+        if (!ts_manager_->LookupTSByUUID(dst_ts_uuid, &dest_desc)) {
+          return Status::NotFound("Could not find destination tserver");
+        }
+        ServerRegistrationPB dest_reg;
+        RETURN_NOT_OK(dest_desc->GetRegistration(&dest_reg));
+
+        auto* add_peer_change = req.add_config_changes();
+        add_peer_change->set_type(ADD_PEER);
+        auto* new_peer = add_peer_change->mutable_peer();
+        new_peer->set_permanent_uuid(dst_ts_uuid);
+        new_peer->set_member_type(RaftPeerPB::NON_VOTER);
+        new_peer->mutable_attrs()->set_promote(true);
+        *new_peer->mutable_last_known_addr() = dest_reg.rpc_addresses(0);
+      }
+
+      // Send the change config request to the tablet leader.
+      ChangeConfigResponsePB resp;
+      RpcController rpc;
+      rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+      req.set_dest_uuid(leader_uuid);
+      req.set_tablet_id(tablet_id);
+      vector<Sockaddr> resolved;
+      RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
+      ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
+      RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
+      if (resp.has_error()) return StatusFromPB(resp.error().status());
+
+      // Successfully scheduled the move. Increment counters for both source and destination.
+      moves_per_tserver_[src_ts_uuid]++;
+      if (!dst_ts_uuid.empty()) {
+        moves_per_tserver_[dst_ts_uuid]++;
+      }
+      VLOG(1) << Substitute(
+          "Scheduled move: tablet $0 from $1 to $2 "
+          "(src_moves=$3, dst_moves=$4)",
+          tablet_id,
+          src_ts_uuid,
+          dst_ts_uuid,
+          moves_per_tserver_[src_ts_uuid],
+          dst_ts_uuid.empty() ? 0 : moves_per_tserver_[dst_ts_uuid]);
+      return Status::OK();
+    }();
+
+    if (!s.ok()) {
+      LOG(WARNING) << Substitute("Failed to schedule move for tablet $0: $1",
+                                 tablet_id, s.ToString());
+      failed_indices.push_back(i);
     }
-
-    // Send the change config request to the tablet leader.
-    ChangeConfigResponsePB resp;
-    RpcController rpc;
-    rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-    req.set_dest_uuid(leader_uuid);
-    req.set_tablet_id(tablet_id);
-    vector<Sockaddr> resolved;
-    RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
-    ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
-    RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
-    if (resp.has_error()) return StatusFromPB(resp.error().status());
-
-    // Successfully scheduled the move. Increment counters for both source and destination.
-    moves_per_tserver_[src_ts_uuid]++;
-    if (!dst_ts_uuid.empty()) {
-      moves_per_tserver_[dst_ts_uuid]++;
-    }
-
-    VLOG(1) << Substitute(
-        "Scheduled move: tablet $0 from $1 to $2 "
-        "(src_moves=$3, dst_moves=$4)",
-        tablet_id,
-        src_ts_uuid,
-        dst_ts_uuid,
-        moves_per_tserver_[src_ts_uuid],
-        dst_ts_uuid.empty() ? 0 : moves_per_tserver_[dst_ts_uuid]);
   }
-  return Status::OK();
+
+  // Erase failed moves back-to-front to keep indices valid during removal.
+  for (int i = static_cast<int>(failed_indices.size()) - 1; i >= 0; --i) {
+    replica_moves->erase(replica_moves->begin() + failed_indices[i]);
+  }
 }
 
 Status AutoRebalancerTask::BuildClusterRawInfo(
@@ -761,9 +784,6 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
       const auto& src_ts_uuid = move.ts_uuid_from;
       const auto& dst_ts_uuid = move.ts_uuid_to;
 
-      // The counter may be zero if ExecuteMoves() failed before reaching this move.
-      // ExecuteMoves() uses RETURN_NOT_OK, which exits early on error, so later
-      // moves in replica_moves never had their counters incremented.
       if (moves_per_tserver_[src_ts_uuid] > 0) {
         moves_per_tserver_[src_ts_uuid]--;
       }
@@ -827,7 +847,6 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
     const auto& src_ts_uuid = move.ts_uuid_from;
     const auto& dst_ts_uuid = move.ts_uuid_to;
 
-    // The counter may be zero if ExecuteMoves() failed before reaching this move.
     if (moves_per_tserver_[src_ts_uuid] > 0) {
       moves_per_tserver_[src_ts_uuid]--;
     }

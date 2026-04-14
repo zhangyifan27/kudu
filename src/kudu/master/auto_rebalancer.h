@@ -25,7 +25,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rebalance/rebalancer.h"
 #include "kudu/util/countdown_latch.h"
@@ -132,14 +131,13 @@ class AutoRebalancerTask {
       HostPort* leader_hp) const;
 
   // Finds replicas that are specified in 'replica_moves' and make requests
-  // to have them moved in order to rebalance the cluster.
-  // Returns a non-OK status if the replica or the replica's tserver
-  // cannot be found, or the request to move the replica cannot be completed.
+  // to have them moved in order to rebalance the cluster. Per-move failures
+  // are logged individually; failed moves are removed from 'replica_moves'.
   //
   // Some information used to clear the replace marker if moves fail will be
   // added to the ReplicaMoves in this method.
-  Status ExecuteMoves(
-      const std::vector<rebalance::Rebalancer::ReplicaMove>& replica_moves);
+  void ExecuteMoves(
+      std::vector<rebalance::Rebalancer::ReplicaMove>* replica_moves);
 
   // Given a set of replica moves, return Status::OK() if checking completion
   // progress does not encounter an error. Otherwise, return the first error
@@ -196,6 +194,7 @@ class AutoRebalancerTask {
 
   // Variables for testing.
   std::atomic<int> number_of_loop_iterations_for_test_;
+  std::atomic<int> moves_attempted_this_round_for_test_;
   std::atomic<int> moves_scheduled_this_round_for_test_;
 };
 

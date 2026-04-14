@@ -353,6 +353,12 @@ class AutoRebalancerTest : public KuduTest {
         auto_leader_rebalancer()->number_of_loop_iterations_for_test_;
   }
 
+  int NumMovesAttempted(int master_idx) {
+    DCHECK(cluster_ != nullptr);
+    return cluster_->mini_master(master_idx)->master()->catalog_manager()->
+        auto_rebalancer()->moves_attempted_this_round_for_test_;
+  }
+
   int NumMovesScheduled(int master_idx,
                         BalanceThreadType type = BalanceThreadType::REPLICA_REBALANCE) {
     DCHECK(cluster_ != nullptr);
@@ -975,8 +981,10 @@ TEST_F(AutoRebalancerTest, NoRebalancingIfReplicasRecovering) {
   NO_FATALS(CheckNoMovesScheduled());
 }
 
-// Make sure the auto-rebalancer reports the failure of scheduled replica movements,
-// in the case that tablet server failure is not yet accounted for by the TSManager.
+// Make sure the auto-rebalancer handles the case where scheduling RPCs fail
+// because tserver failure is not yet accounted for by the TSManager.
+// Failed-to-schedule moves must be removed from replica_moves so
+// CheckReplicaMovesCompleted doesn't wait on them indefinitely.
 TEST_F(AutoRebalancerTest, TestHandlingFailedTservers) {
   // Set a high timeout for an unresponsive tserver to be presumed dead,
   // so the TSManager believes it is still available.
@@ -997,23 +1005,37 @@ TEST_F(AutoRebalancerTest, TestHandlingFailedTservers) {
     NO_FATALS(cluster_->mini_tablet_server(i)->Shutdown());
   }
 
-  // Capture the glog output to ensure failed replica movements occur
-  // and the warnings are logged.
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  const auto initial_loops = NumLoopIterations(leader_idx);
+
+  // Capture glog output to verify per-move scheduling failures are logged.
   StringVectorSink pre_capture_logs;
   {
     ScopedRegisterSink reg(&pre_capture_logs);
     // Bring up a new tserver.
     ASSERT_OK(cluster_->AddTabletServer());
 
-    // The TSManager should still believe the original tservers are available,
-    // so the auto-rebalancer should attempt to schedule replica moves from those
-    // tservers to the new one.
-    NO_FATALS(CheckSomeMovesScheduled());
+    // The TSManager still believes the original tservers are available, so
+    // GetMoves will find moves to schedule. All scheduling RPCs will fail
+    // because the original tservers are unreachable. The three assertions
+    // are evaluated atomically within one ASSERT_EVENTUALLY iteration to
+    // verify the fix without vacuous passes:
+    // 1. The loop is not blocked (at least two more iterations ran).
+    // 2. GetMoves found moves to attempt this round (attempted > 0), proving
+    //    the cluster was imbalanced and work was dispatched to ExecuteMoves.
+    // 3. After ExecuteMoves, zero moves remain (scheduled == 0), proving
+    //    that the failed moves were removed rather than left pending.
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_LT(initial_loops + 1, NumLoopIterations(leader_idx));
+      ASSERT_GT(NumMovesAttempted(leader_idx), 0);
+      ASSERT_EQ(0, NumMovesScheduled(leader_idx));
+    });
   }
   {
     SCOPED_TRACE(JoinStrings(pre_capture_logs.logged_msgs(), "\n"));
     ASSERT_STRINGS_ANY_MATCH(pre_capture_logs.logged_msgs(),
-        "scheduled replica move failed to complete|failed to send replica move request");
+        "Failed to schedule move for tablet");
   }
 
   // Wait for the TSManager to realize that the original tservers are unavailable.
