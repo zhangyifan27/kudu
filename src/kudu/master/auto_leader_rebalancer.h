@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -72,11 +73,15 @@ class AutoLeaderRebalancerTask {
   // Runs the main loop of the auto-leader-rebalancing thread.
   void RunLoop();
 
-  // Run Leader Rebalance for a table
+  // Run Leader Rebalance for a table.
+  // global_leader_count, when provided, is read as a tiebreaker during destination scoring and
+  // updated with every planned move so that successive table calls share a consistent view of
+  // in-round leader distribution.
   Status RunLeaderRebalanceForTable(
       const scoped_refptr<TableInfo>& table_info,
       const std::vector<std::string>& tserver_uuids,
       const std::unordered_set<std::string>& exclude_dest_uuids,
+      std::unordered_map<std::string, int>* global_leader_count = nullptr,
       AutoLeaderRebalancerTask::ExecuteMode mode = AutoLeaderRebalancerTask::ExecuteMode::NORMAL);
 
   // Only one task can be scheduled at a time.

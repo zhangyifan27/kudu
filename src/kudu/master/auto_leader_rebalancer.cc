@@ -136,13 +136,14 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     const scoped_refptr<TableInfo>& table_info,
     const vector<string>& tserver_uuids,
     const unordered_set<string>& exclude_dest_uuids,
+    std::unordered_map<string, int>* global_leader_count,
     AutoLeaderRebalancerTask::ExecuteMode mode) {
   LOG(INFO) << Substitute("leader rebalance for table $0", table_info->table_name());
   TableMetadataLock table_l(table_info.get(), LockMode::READ);
   const SysTablesEntryPB& table_data = table_info->metadata().state().pb;
   int replication_factor = table_data.num_replicas();
   DCHECK_GT(replication_factor, 0);
-  if (table_data.state() == SysTablesEntryPB::REMOVED || replication_factor == 1) {
+  if (table_data.state() == SysTablesEntryPB::REMOVED) {
     // Don't worry about rebalancing replicas that belong to deleted tables.
     return Status::OK();
   }
@@ -210,6 +211,22 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     }
   }
 
+  // Count this table's leaders into the global map before the early return for
+  // single replica tables below. Those leaders can't be moved, but they are
+  // still real load. If we left them out, a tserver holding many of them would
+  // look empty to the tie breaker and keep getting chosen as a move target.
+  if (global_leader_count) {
+    for (const auto& [uuid, tablet_ids] : leader_tablet_ids_by_ts_uuid) {
+      (*global_leader_count)[uuid] += static_cast<int>(tablet_ids.size());
+    }
+  }
+
+  // A tablet with a single replica has no follower to hand leadership to, so
+  // there is nothing to rebalance. We already counted its leader above.
+  if (replication_factor == 1) {
+    return Status::OK();
+  }
+
   // step 2.
   // pick the servers which number of leaders greater than 1/3 of number of all replicas
   // <uuid, number of replica, number of leader>
@@ -275,36 +292,67 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
       if (uuid_followers.size() + 1 < replication_factor) {
         continue;
       }
-      double min_score = 1;
+      // Pick the follower with the lowest leader ratio for this table. If two
+      // followers tie, prefer the one with fewer leaders across all tables. If
+      // they still tie, fall back to the smaller uuid so the result does not
+      // depend on the order replicas happen to come back in.
+      //
+      // The best ratio so far is tracked as a fraction (best_leader_count over
+      // best_replica_count, starting at 1/1, the worst possible ratio). Ratios
+      // are compared by cross multiplying, which keeps ties exact in a way that
+      // comparing rounded doubles would not.
+      int32_t best_leader_count = 1;
+      int32_t best_replica_count = 1;
+      int best_global_count = 0;
+      bool dest_invalid = false;
       for (int j = 0; j < uuid_followers.size(); j++) {
-        if (ContainsKey(exclude_dest_uuids, uuid_followers[j])) {
+        const string& follower_uuid = uuid_followers[j];
+        if (ContainsKey(exclude_dest_uuids, follower_uuid)) {
           continue;
         }
         std::pair<int32_t, int32_t>& replica_and_leader_count =
-            replica_and_leader_count_by_ts_uuid[uuid_followers[j]];
+            replica_and_leader_count_by_ts_uuid[follower_uuid];
         int32_t replica_count = replica_and_leader_count.first;
         if (replica_count <= 0) {
-          dest_follower_uuid.clear();
+          dest_invalid = true;
           break;
         }
         int32_t leader_count = replica_and_leader_count.second;
-        // double is not precise.
-        double score = static_cast<double>(leader_count) / replica_count;
-        if (score < min_score) {
-          min_score = score;
-          dest_follower_uuid = uuid_followers[j];
+        int global_count = global_leader_count
+            ? FindWithDefault(*global_leader_count, follower_uuid, 0) : 0;
+        // leader_count / replica_count  vs  best_leader_count / best_replica_count
+        const int64_t lhs = static_cast<int64_t>(leader_count) * best_replica_count;
+        const int64_t rhs = static_cast<int64_t>(best_leader_count) * replica_count;
+        bool better;
+        if (lhs != rhs) {
+          better = lhs < rhs;
+        } else if (global_count != best_global_count) {
+          better = global_count < best_global_count;
+        } else {
+          // Still tied. A follower that is already full (ratio 1/1, our starting
+          // value) is never a valid target, so only break the tie once we have
+          // a real candidate.
+          better = !dest_follower_uuid.empty() && follower_uuid < dest_follower_uuid;
+        }
+        if (better) {
+          best_leader_count = leader_count;
+          best_replica_count = replica_count;
+          best_global_count = global_count;
+          dest_follower_uuid = follower_uuid;
         }
       }
-      if (dest_follower_uuid.empty()) {
+      if (dest_invalid || dest_follower_uuid.empty()) {
         continue;
       }
       std::pair<int32_t, int32_t>& replica_and_leader_count =
           replica_and_leader_count_by_ts_uuid[leader_uuid];
       int32_t replica_count = replica_and_leader_count.first;
       int32_t leader_count = replica_and_leader_count.second;
-      double leader_score = static_cast<double>(leader_count) / replica_count;
-      if (min_score > leader_score) {
-        // Skip it, because the transfer will cause more leader skew
+      // Skip the move if the destination already has a higher leader ratio than
+      // the source, since that would only make the skew worse. Compared as
+      // fractions to stay exact.
+      if (static_cast<int64_t>(best_leader_count) * replica_count >
+          static_cast<int64_t>(leader_count) * best_replica_count) {
         continue;
       }
 
@@ -312,6 +360,10 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
           {tablet_id, std::pair<string, string>(leader_uuid, dest_follower_uuid)});
       replica_and_leader_count_by_ts_uuid[leader_uuid].second--;
       replica_and_leader_count_by_ts_uuid[dest_follower_uuid].second++;
+      if (global_leader_count) {
+        (*global_leader_count)[leader_uuid]--;
+        (*global_leader_count)[dest_follower_uuid]++;
+      }
       if (leader_transfer_tasks.size() >= FLAGS_leader_rebalancing_max_moves_per_round) {
         break;
       }
@@ -442,10 +494,22 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
       catalog_manager_->GetAllTables(&table_infos);
     }
   }
+
+  // Start the global map at 0 for every live tserver. As each table is processed
+  // we add its real leader counts and apply any planned moves, so later tables
+  // can see the leader load across all tables when they need to break a tie.
+  std::unordered_map<string, int> global_leader_count_by_ts_uuid;
+  for (const auto& uuid : tserver_uuids) {
+    global_leader_count_by_ts_uuid[uuid] = 0;
+  }
+
   for (const auto& table_info : table_infos) {
     RETURN_NOT_OK(RunLeaderRebalanceForTable(
-        table_info, tserver_uuids, exclude_dest_uuids));
+        table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid));
   }
+  // TODO(KUDU-3767): add a post-loop global pass here to detect and correct
+  // tservers that are globally overloaded even when per-table balance is achieved
+  // (e.g. many single-tablet tables whose leaders all land on the same tserver).
   // @TODO(duyuqi)
   // Enrich the log and add metrics for leader rebalancer.
   LOG(INFO) << "All tables' leader rebalancing finished this round";

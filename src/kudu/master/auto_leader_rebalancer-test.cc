@@ -19,12 +19,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,6 +36,7 @@
 
 #include "kudu/client/client.h"
 #include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/consensus.proxy.h"// IWYU pragma: keep
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -49,7 +52,6 @@
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
-#include "kudu/consensus/consensus.proxy.h"// IWYU pragma: keep
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -118,6 +120,15 @@ class LeaderRebalancerTest : public KuduTest {
 
   std::string table_name() { return workload_->table_name(); }
 
+  Status RunLeaderRebalanceForTable(
+      const scoped_refptr<TableInfo>& table_info,
+      const vector<string>& tserver_uuids,
+      std::unordered_map<string, int>* global_leader_count) {
+    master::Master* master = cluster_->mini_master()->master();
+    return master->catalog_manager()->auto_leader_rebalancer()
+        ->RunLeaderRebalanceForTable(table_info, tserver_uuids, {}, global_leader_count);
+  }
+
   Status CheckLeaderBalance() {
     // Leader master
     master::Master* master = cluster_->mini_master()->master();
@@ -140,7 +151,7 @@ class LeaderRebalancerTest : public KuduTest {
     }
 
     return catalog_manager->auto_leader_rebalancer()->RunLeaderRebalanceForTable(
-        table_info, tserver_uuids, {}, AutoLeaderRebalancerTask::ExecuteMode::TEST);
+        table_info, tserver_uuids, {}, nullptr, AutoLeaderRebalancerTask::ExecuteMode::TEST);
   }
 
   // Get the leader numbers of each tablet server.
@@ -207,10 +218,21 @@ class LeaderRebalancerTest : public KuduTest {
 
     int32_t index = 0;
     int32_t tmp_distribution = 0;
-    MiniTabletServer* tserver = cluster_->mini_tablet_server(0);
+    // Skip any leading tablet servers that should hold no leaders.
+    while (index < static_cast<int32_t>(leader_distribution.size()) &&
+           leader_distribution.at(index) == 0) {
+      index++;
+    }
+    MiniTabletServer* tserver = cluster_->mini_tablet_server(index);
     for (const auto& tablet : table->tablet_map()) {
       if (tmp_distribution >= leader_distribution.at(index)) {
-        index++;
+        // Advance to the next tablet server that should hold at least one
+        // leader, skipping any that should hold none. This lets the
+        // distribution vector contain interior zeros (e.g. {1, 0, 1}).
+        do {
+          index++;
+        } while (index < static_cast<int32_t>(leader_distribution.size()) &&
+                 leader_distribution.at(index) == 0);
         tmp_distribution = 0;
         tserver = cluster_->mini_tablet_server(index);
       }
@@ -534,6 +556,139 @@ TEST_F(LeaderRebalancerTest, TestMaintenanceMode) {
       ASSERT_NE(consensus::RaftPeerPB::LEADER, replica.role());
     }
   }
+}
+
+// Check that the global tie breaker in RunLeaderRebalanceForTable prefers a
+// tserver with fewer leaders overall when two candidates are equally good for
+// the table being balanced.
+//
+// Setup: two tables, each with 2 tablets and RF=3 on a 3 tserver cluster, so
+// every tserver holds a replica of every tablet.
+//   - table2 puts both of its leaders on ts0 ({2,0,0}). ts0 is over the target
+//     for this table (ceil(2/3)=1) and has to give up one leader. The two
+//     places it could go, ts1 and ts2, each hold 0 of their 2 replicas as
+//     leaders, so they are equally good for table2.
+//   - table1 is already balanced, but we put its second leader on whichever of
+//     those two has the smaller uuid, so that tserver ends up with more leaders
+//     overall.
+//
+// We rebalance table1 first to fill in the global counts, then rebalance
+// table2. Since the two destinations are tied for table2, the choice comes down
+// to the overall counts: the tserver with the larger uuid (0 leaders so far)
+// should win over the one with the smaller uuid (1 leader).
+//
+// This is deterministic either way. With the tie breaker the leader lands on
+// the larger uuid tserver. Without it the tie falls through to the uuid
+// comparison, which always picks the smaller uuid tserver (the loaded one), and
+// the check below fails. So the test actually guards against the tie breaker
+// being removed, rather than passing or failing depending on the order the
+// replicas happen to come back in.
+TEST_F(LeaderRebalancerTest, MultiTableLeaderBalance) {
+  const int kNumTServers = 3;
+  const int kNumTablets = 2;
+
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster());
+
+  const string kTable1Name = "multi_table_leader_balance_table1";
+  workload_.reset(new TestWorkload(cluster_.get()));
+  workload_->set_table_name(kTable1Name);
+  workload_->set_num_tablets(kNumTablets);
+  workload_->set_num_replicas(3);
+  workload_->Setup();
+
+  const string kTable2Name = "multi_table_leader_balance_table2";
+  workload_.reset(new TestWorkload(cluster_.get()));
+  workload_->set_table_name(kTable2Name);
+  workload_->set_num_tablets(kNumTablets);
+  workload_->set_num_replicas(3);
+  workload_->Setup();
+
+  // ts0 holds both of table2's leaders and is the source of the move. ts1 and
+  // ts2 are the two tied destinations. We want the one with the smaller global
+  // count to be the tserver with the larger uuid.
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  const string ts1_uuid = cluster_->mini_tablet_server(1)->uuid();
+  const string ts2_uuid = cluster_->mini_tablet_server(2)->uuid();
+  const string& lo_uuid = std::min(ts1_uuid, ts2_uuid);
+  const string& hi_uuid = std::max(ts1_uuid, ts2_uuid);
+
+  // table1 is balanced ({1,1,0} in some order), but we put its second leader on
+  // the smaller uuid tserver, so once table1 is counted the global totals are
+  // lo_uuid=1 and hi_uuid=0.
+  std::vector<int32_t> table1_dist(kNumTServers, 0);
+  table1_dist[0] = 1;
+  if (lo_uuid == ts1_uuid) {
+    table1_dist[1] = 1;
+  } else {
+    table1_dist[2] = 1;
+  }
+  ASSERT_OK(MakeLeaderDistribution(table1_dist, kTable1Name));
+  // table2 keeps all its leaders on ts0, which forces exactly one move.
+  ASSERT_OK(MakeLeaderDistribution({kNumTablets, 0, 0}, kTable2Name));
+
+  using LeaderMap = std::map<string, int32_t>;
+
+  // Wait for the leadership moves from MakeLeaderDistribution to settle.
+  ASSERT_EVENTUALLY([&] {
+    LeaderMap dist1;
+    LeaderMap dist2;
+    ASSERT_OK(GetLeaderDistribution(&dist1, kTable1Name));
+    ASSERT_OK(GetLeaderDistribution(&dist2, kTable2Name));
+    ASSERT_EQ(1, dist1.at(ts0_uuid));
+    ASSERT_EQ(1, dist1.at(lo_uuid));
+    ASSERT_EQ(0, dist1.at(hi_uuid));
+    ASSERT_EQ(kNumTablets, dist2.at(ts0_uuid));
+  });
+
+  master::Master* master = cluster_->mini_master()->master();
+
+  TSDescriptorVector descriptors;
+  master->ts_manager()->GetAllDescriptors(&descriptors);
+  vector<string> tserver_uuids;
+  for (const auto& e : descriptors) {
+    if (!e->PresumedDead()) {
+      tserver_uuids.emplace_back(e->permanent_uuid());
+    }
+  }
+
+  // Start the global map at 0 for every tserver, just like RunLeaderRebalancer.
+  std::unordered_map<string, int> global_leader_count;
+  for (const auto& uuid : tserver_uuids) {
+    global_leader_count[uuid] = 0;
+  }
+
+  scoped_refptr<TableInfo> table1_info;
+  scoped_refptr<TableInfo> table2_info;
+  {
+    CatalogManager::ScopedLeaderSharedLock leaderlock(master->catalog_manager());
+    master->catalog_manager()->GetTableInfoByName(kTable1Name, &table1_info);
+    master->catalog_manager()->GetTableInfoByName(kTable2Name, &table2_info);
+  }
+
+  // Rebalance table1 first. Nothing moves (it is already balanced), but its
+  // leader counts get added to the global map (ts0+1, lo_uuid+1, hi_uuid+0),
+  // which sets up the imbalance the tie breaker needs.
+  ASSERT_OK(RunLeaderRebalanceForTable(table1_info, tserver_uuids, &global_leader_count));
+  ASSERT_EQ(1, global_leader_count.at(lo_uuid));
+  ASSERT_EQ(0, global_leader_count.at(hi_uuid));
+
+  // Now rebalance table2. ts0 has 2 leaders but the target is ceil(2/3)=1, so it
+  // sheds one. lo_uuid and hi_uuid are tied for table2 (0 of 2 each), but their
+  // global counts differ (1 vs 0), so the leader should go to hi_uuid.
+  ASSERT_OK(RunLeaderRebalanceForTable(table2_info, tserver_uuids, &global_leader_count));
+
+  // Wait for table2's move to settle, then check that hi_uuid (not lo_uuid) got
+  // the leader. Without the tie breaker the tie falls back to the smaller uuid
+  // (lo_uuid, the one we loaded earlier), leaving the cluster skewed overall.
+  AssertEventually([&] {
+    LeaderMap dist2;
+    ASSERT_OK(GetLeaderDistribution(&dist2, kTable2Name));
+    ASSERT_EQ(1, dist2.at(ts0_uuid));
+    ASSERT_EQ(1, dist2.at(hi_uuid));
+    ASSERT_EQ(0, dist2.at(lo_uuid));
+  }, MonoDelta::FromSeconds(120));
+  NO_PENDING_FATALS();
 }
 
 class FilterSoftDeletedTableTest :
