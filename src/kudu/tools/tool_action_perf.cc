@@ -132,6 +132,23 @@
 // The range partitioning splits will be the same as those in the
 // range-partitioning-only example.
 //
+// The schema of an auto-created table can be widened by
+// '--table_num_int_columns' and '--table_num_string_columns'. By default both
+// flags are set to 1, which preserves the legacy schema (a single 'int_val'
+// INT32 column and a single 'string_val' STRING column in addition to the
+// 'key' INT64 primary key). Setting either to N >= 2 produces N suffix-numbered
+// columns of that type (e.g. 'int_val_1', 'int_val_2', ...); setting to 0
+// omits that column type entirely. The example below auto-creates a table with
+// 8 INT32 and 4 STRING non-key columns for wide-row write benchmarking:
+//
+//   kudu perf loadgen 127.0.0.1 \
+//     --table_num_int_columns=8 \
+//     --table_num_string_columns=4 \
+//     --num_threads=4 --num_rows_per_thread=25000
+//
+// These flags have no effect when '--table_name' is set: the schema of the
+// existing table is used as-is.
+//
 // Below are illustrations of range partitioning and non-random write
 // workloads. The y-axis for both the threads and the tablets is the keyspace,
 // increasing going downwards.
@@ -356,6 +373,22 @@ DEFINE_int32(table_num_range_partitions, 1,
 DEFINE_int32(table_num_replicas, 1,
              "The number of replicas for the auto-created table; "
              "0 means 'use server-side default'.");
+DEFINE_int32(table_num_int_columns, 1,
+             "The number of INT32 non-key columns to add to the auto-created "
+             "table. Must be >= 0. With the default value of 1 the column is "
+             "named 'int_val' to preserve the legacy auto-created schema; "
+             "with N >= 2 the columns are named 'int_val_1', 'int_val_2', "
+             "... 'int_val_N'. Has no effect when --table_name is set: the "
+             "schema of the existing table is used as-is.");
+DEFINE_int32(table_num_string_columns, 1,
+             "The number of STRING non-key columns to add to the auto-created "
+             "table. Must be >= 0. The values written into these columns are "
+             "controlled by --string_len / --string_fixed. With the default "
+             "value of 1 the column is named 'string_val' to preserve the "
+             "legacy auto-created schema; with N >= 2 the columns are named "
+             "'string_val_1', 'string_val_2', ... 'string_val_N'. Has no "
+             "effect when --table_name is set: the schema of the existing "
+             "table is used as-is.");
 DEFINE_bool(use_random, false,
             "Whether to use random numbers instead of sequential ones for both primary keys and "
             "non-primary key columns. In case of using random numbers collisions are "
@@ -434,6 +467,21 @@ bool ValidatePartitionFlags() {
   return true;
 }
 GROUP_FLAG_VALIDATOR(partition_flags, &ValidatePartitionFlags);
+
+bool ValidateAutoTableColumnFlags() {
+  if (FLAGS_table_num_int_columns < 0) {
+    LOG(ERROR) << Substitute("--table_num_int_columns must be >= 0, got $0",
+                             FLAGS_table_num_int_columns);
+    return false;
+  }
+  if (FLAGS_table_num_string_columns < 0) {
+    LOG(ERROR) << Substitute("--table_num_string_columns must be >= 0, got $0",
+                             FLAGS_table_num_string_columns);
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(auto_table_column_flags, &ValidateAutoTableColumnFlags);
 
 bool ValidateTxnFlags() {
   if ((FLAGS_txn_commit || FLAGS_txn_rollback || FLAGS_txn_start) &&
@@ -964,8 +1012,22 @@ Status TestLoadGenerator(const RunnerContext& context) {
     KuduSchema schema;
     KuduSchemaBuilder b;
     b.AddColumn(kKeyColumnName)->Type(KuduColumnSchema::INT64)->NotNull()->PrimaryKey();
-    b.AddColumn("int_val")->Type(KuduColumnSchema::INT32);
-    b.AddColumn("string_val")->Type(KuduColumnSchema::STRING);
+    // Use the bare base name when only one column of a given type is requested
+    // so the auto-created schema with the default flag values is byte-for-byte
+    // identical to the legacy 3-column schema. Otherwise, suffix the columns
+    // with a 1-based index ('int_val_1', 'int_val_2', ...).
+    auto add_columns = [&](const string& base_name,
+                           KuduColumnSchema::DataType type,
+                           int count) {
+      for (int i = 0; i < count; ++i) {
+        const string col_name = (count == 1)
+            ? base_name
+            : Substitute("$0_$1", base_name, i + 1);
+        b.AddColumn(col_name)->Type(type);
+      }
+    };
+    add_columns("int_val", KuduColumnSchema::INT32, FLAGS_table_num_int_columns);
+    add_columns("string_val", KuduColumnSchema::STRING, FLAGS_table_num_string_columns);
     if (FLAGS_enable_array_columns) {
       KuduColumnSchema::KuduArrayTypeDescriptor ai_int64(KuduColumnSchema::INT64);
       KuduColumnSchema::KuduNestedTypeDescriptor nti_int64(ai_int64);
@@ -1212,8 +1274,10 @@ unique_ptr<Mode> BuildPerfMode() {
                  "the rows it inserted into the table. Neither the existing table "
                  "nor its data is ever dropped/deleted."))
       .AddOptionalParameter("table_num_hash_partitions")
+      .AddOptionalParameter("table_num_int_columns")
       .AddOptionalParameter("table_num_range_partitions")
       .AddOptionalParameter("table_num_replicas")
+      .AddOptionalParameter("table_num_string_columns")
       .AddOptionalParameter("txn_start")
       .AddOptionalParameter("txn_commit")
       .AddOptionalParameter("txn_rollback")

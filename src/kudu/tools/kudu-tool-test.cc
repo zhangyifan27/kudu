@@ -3765,6 +3765,155 @@ TEST_F(ToolTest, TestLoadgenDefaultParameters) {
   NO_FATALS(RunLoadgen());
 }
 
+namespace {
+// Locate the single auto-created loadgen table on the cluster (created when
+// 'kudu perf loadgen' is invoked without --table_name) and verify that its
+// schema matches the expected (column name, type) sequence in order.
+//
+// The row-count check produced by --run_scan is not sufficient on its own:
+// GenerateRowData() iterates whatever columns the schema has, so a regression
+// where extra columns are silently dropped or mis-typed would still leave the
+// expected/actual row counts equal. Inspecting the schema closes that gap.
+void VerifyLoadgenAutoTableSchema(
+    KuduClient* client,
+    const vector<pair<string, client::KuduColumnSchema::DataType>>& expected_cols) {
+  vector<string> tables;
+  ASSERT_OK(client->ListTables(&tables));
+  string auto_table_name;
+  for (const auto& t : tables) {
+    if (t.find("loadgen_auto_") != string::npos) {
+      ASSERT_TRUE(auto_table_name.empty())
+          << "found multiple auto-created tables: " << auto_table_name
+          << ", " << t;
+      auto_table_name = t;
+    }
+  }
+  ASSERT_FALSE(auto_table_name.empty()) << "no loadgen_auto_* table found";
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(auto_table_name, &table));
+  const KuduSchema& schema = table->schema();
+  ASSERT_EQ(expected_cols.size(), schema.num_columns());
+  for (size_t i = 0; i < expected_cols.size(); ++i) {
+    ASSERT_EQ(expected_cols[i].first, schema.Column(i).name())
+        << "column index " << i;
+    ASSERT_EQ(expected_cols[i].second, schema.Column(i).type())
+        << "column index " << i;
+  }
+}
+} // anonymous namespace
+
+// Run loadgen against an auto-created table whose width is controlled by
+// --table_num_int_columns and --table_num_string_columns. The test verifies
+// both the on-cluster schema (column count, names, and types) and that the
+// post-insertion scan reads back the expected number of rows -- together this
+// confirms that every requested column was created and written.
+TEST_F(ToolTest, TestLoadgenAutoTableNumColumns) {
+  static constexpr int kNumIntCols = 5;
+  static constexpr int kNumStringCols = 3;
+  string out;
+  NO_FATALS(RunLoadgen(
+      /*num_tservers=*/1,
+      {
+        Substitute("--table_num_int_columns=$0", kNumIntCols),
+        Substitute("--table_num_string_columns=$0", kNumStringCols),
+        "--num_threads=2",
+        "--num_rows_per_thread=200",
+        "--keep_auto_table",
+        "--run_scan",
+      },
+      /*table_name=*/"",
+      &out));
+  ASSERT_STR_MATCHES(out, "expected rows: 400");
+  ASSERT_STR_MATCHES(out, "actual rows  : 400");
+
+  vector<pair<string, client::KuduColumnSchema::DataType>> expected;
+  expected.emplace_back("key", client::KuduColumnSchema::INT64);
+  for (int i = 0; i < kNumIntCols; ++i) {
+    expected.emplace_back(Substitute("int_val_$0", i + 1),
+                          client::KuduColumnSchema::INT32);
+  }
+  for (int i = 0; i < kNumStringCols; ++i) {
+    expected.emplace_back(Substitute("string_val_$0", i + 1),
+                          client::KuduColumnSchema::STRING);
+  }
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(VerifyLoadgenAutoTableSchema(client.get(), expected));
+}
+
+// Edge case: --table_num_int_columns=0 and --table_num_string_columns=0 yield
+// an auto-created table consisting of just the INT64 primary key column.
+TEST_F(ToolTest, TestLoadgenAutoTablePkOnly) {
+  string out;
+  NO_FATALS(RunLoadgen(
+      /*num_tservers=*/1,
+      {
+        "--table_num_int_columns=0",
+        "--table_num_string_columns=0",
+        "--num_threads=1",
+        "--num_rows_per_thread=100",
+        "--keep_auto_table",
+        "--run_scan",
+      },
+      /*table_name=*/"",
+      &out));
+  ASSERT_STR_MATCHES(out, "expected rows: 100");
+  ASSERT_STR_MATCHES(out, "actual rows  : 100");
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(VerifyLoadgenAutoTableSchema(
+      client.get(),
+      {{"key", client::KuduColumnSchema::INT64}}));
+}
+
+// Backward-compatibility regression test: with both column-count flags left at
+// their defaults (1 + 1), the auto-created schema must remain byte-for-byte
+// identical to the legacy three-column layout ('key', 'int_val', 'string_val')
+// so existing users and downstream tooling are unaffected.
+TEST_F(ToolTest, TestLoadgenAutoTableLegacySchemaPreserved) {
+  string out;
+  NO_FATALS(RunLoadgen(
+      /*num_tservers=*/1,
+      {
+        "--num_threads=1",
+        "--num_rows_per_thread=10",
+        "--keep_auto_table",
+        "--run_scan",
+      },
+      /*table_name=*/"",
+      &out));
+  ASSERT_STR_MATCHES(out, "actual rows  : 10");
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(VerifyLoadgenAutoTableSchema(
+      client.get(),
+      {
+        {"key", client::KuduColumnSchema::INT64},
+        {"int_val", client::KuduColumnSchema::INT32},
+        {"string_val", client::KuduColumnSchema::STRING},
+      }));
+}
+
+// Negative values for the column-count flags must be rejected at startup by
+// the GROUP_FLAG_VALIDATOR.
+TEST_F(ToolTest, TestLoadgenAutoTableNumColumnsNegativeRejected) {
+  ExternalMiniClusterOptions opts;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const vector<string> args = {
+    "perf",
+    "loadgen",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    "--table_num_int_columns=-1",
+    "--num_rows_per_thread=1",
+  };
+  string err;
+  Status s = RunKuduTool(args, nullptr, &err);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_CONTAINS(err, "--table_num_int_columns must be >= 0");
+}
+
 // Verify it's possible to run loadgen to create a table, no records inserted.
 // Also verify that --num_rows_per_thread=0 in case of existing table
 // results in no rows inserted.
