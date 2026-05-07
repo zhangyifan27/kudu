@@ -80,8 +80,6 @@ using kudu::consensus::BulkChangeConfigRequestPB;
 using kudu::consensus::ChangeConfigResponsePB;
 using kudu::consensus::ConsensusServiceProxy;
 using kudu::consensus::ConsensusStatePB;
-using kudu::consensus::GetConsensusStateRequestPB;
-using kudu::consensus::GetConsensusStateResponsePB;
 using kudu::consensus::LeaderStepDownMode;
 using kudu::consensus::LeaderStepDownRequestPB;
 using kudu::consensus::LeaderStepDownResponsePB;
@@ -488,7 +486,7 @@ void AutoRebalancerTask::ExecuteMoves(
   vector<int> failed_indices;
 
   for (int i = 0; i < static_cast<int>(replica_moves->size()); ++i) {
-    const auto& move_info = (*replica_moves)[i];
+    auto& move_info = (*replica_moves)[i];
     const auto& tablet_id = move_info.tablet_uuid;
     const auto& src_ts_uuid = move_info.ts_uuid_from;
     const auto& dst_ts_uuid = move_info.ts_uuid_to;
@@ -496,6 +494,20 @@ void AutoRebalancerTask::ExecuteMoves(
     // Attempt to schedule this move. On any failure, log a warning and skip
     // this move so the remaining moves are still attempted.
     Status s = [&]() -> Status {
+      // Read the current config opid_index before sending BulkChangeConfig.
+      // This is stored on the move so that CheckMoveCompleted can use it as
+      // a freshness gate: if CatalogManager still shows the same opid_index
+      // after the move is dispatched, the heartbeat carrying the new config
+      // hasn't arrived yet and the check should wait rather than act on
+      // stale data.
+      ConsensusStatePB pre_cstate;
+      {
+        CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+        RETURN_NOT_OK(l.first_failed_status());
+        RETURN_NOT_OK(catalog_manager_->GetTabletConsensusState(tablet_id, &pre_cstate));
+      }
+      const int64_t pre_opid_index = pre_cstate.committed_config().opid_index();
+
       string leader_uuid;
       HostPort leader_hp;
       RETURN_NOT_OK(GetTabletLeader(tablet_id, &leader_uuid, &leader_hp));
@@ -531,16 +543,33 @@ void AutoRebalancerTask::ExecuteMoves(
       }
 
       // Send the change config request to the tablet leader.
+      // Set the CAS index so the request is rejected if another actor has
+      // already modified the config since we read pre_opid_index. This
+      // guarantees that if the request succeeds, the new config's opid_index
+      // is greater than pre_opid_index.
+      //
+      // Note: the opid_index read above and this RPC are not atomic. If a
+      // heartbeat delivers a config update to CatalogManager between the two
+      // calls (e.g. the leader applied an unrelated config change), the
+      // leader's committed index will be higher than pre_opid_index and the
+      // CAS will fail. The move is then treated as a scheduling failure and
+      // retried next cycle.
       ChangeConfigResponsePB resp;
       RpcController rpc;
       rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
       req.set_dest_uuid(leader_uuid);
       req.set_tablet_id(tablet_id);
+      req.set_cas_config_opid_index(pre_opid_index);
       vector<Sockaddr> resolved;
       RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
       ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
       RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
       if (resp.has_error()) return StatusFromPB(resp.error().status());
+
+      // Record the config opid_index that was current before this move was
+      // dispatched. CheckMoveCompleted uses this to determine whether
+      // CatalogManager has received the heartbeat reflecting the new config.
+      move_info.config_opid_idx = pre_opid_index;
 
       // Successfully scheduled the move. Increment counters for both source and destination.
       moves_per_tserver_[src_ts_uuid]++;
@@ -869,9 +898,6 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
   return Status::OK();
 }
 
-// TODO(hannah.nguyen): Retrieve consensus state information from the
-// CatalogManager instead. The current implementation mirrors
-// CheckCompleteMove() in tools/tool_replica_util.cc.
 Status AutoRebalancerTask::CheckMoveCompleted(
     const rebalance::Rebalancer::ReplicaMove& replica_move,
     bool* is_complete) {
@@ -887,35 +913,31 @@ Status AutoRebalancerTask::CheckMoveCompleted(
   const auto& from_ts_uuid = replica_move.ts_uuid_from;
   const auto& to_ts_uuid = replica_move.ts_uuid_to;
 
-  // Get the latest leader info. This may change later.
-  string orig_leader_uuid;
-  HostPort orig_leader_hp;
-  RETURN_NOT_OK(GetTabletLeader(tablet_uuid, &orig_leader_uuid, &orig_leader_hp));
-  shared_ptr<TSDescriptor> desc;
-  if (!ts_manager_->LookupTSByUUID(orig_leader_uuid, &desc)) {
-    return Status::NotFound("Could not find leader replica's tserver");
-  }
-  shared_ptr<ConsensusServiceProxy> proxy;
-  RETURN_NOT_OK(desc->GetConsensusProxy(messenger_, &proxy));
-
-  // Check if replica at 'to_ts_uuid' is in the config, and if it has been
-  // promoted to voter.
+  // Read consensus state from CatalogManager. CatalogManager's copy is
+  // populated via tserver-to-master heartbeats and may lag the tserver's
+  // actual Raft state by up to one heartbeat interval. We use the config
+  // opid_index recorded before BulkChangeConfig was sent (stored in
+  // replica_move.config_opid_idx) as a freshness gate: if CatalogManager
+  // still shows the same opid_index, the heartbeat carrying the new config
+  // hasn't arrived yet and we wait rather than act on stale data.
   ConsensusStatePB cstate;
-  GetConsensusStateRequestPB req;
-  GetConsensusStateResponsePB resp;
-  RpcController rpc;
-  rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-  req.set_dest_uuid(orig_leader_uuid);
-  req.add_tablet_ids(tablet_uuid);
-  RETURN_NOT_OK(proxy->GetConsensusState(req, &resp, &rpc));
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+    RETURN_NOT_OK(l.first_failed_status());
+    RETURN_NOT_OK(catalog_manager_->GetTabletConsensusState(tablet_uuid, &cstate));
   }
-  if (resp.tablets_size() == 0) {
-    return Status::NotFound("tablet not found:", tablet_uuid);
+
+  // config_opid_idx is always set for moves that reach this point: it is
+  // populated in ExecuteMoves immediately after BulkChangeConfig succeeds,
+  // and only successfully dispatched moves remain in replica_moves.
+  DCHECK(replica_move.config_opid_idx);
+
+  // If the opid_index hasn't advanced past what we saw before scheduling,
+  // CatalogManager hasn't yet processed the heartbeat for the new config.
+  // Return without acting so we retry on the next polling cycle.
+  if (cstate.committed_config().opid_index() <= *replica_move.config_opid_idx) {
+    return Status::OK();  // is_complete remains false; catalog not yet fresh
   }
-  DCHECK_EQ(1, resp.tablets_size());
-  cstate = resp.tablets(0).cstate();
 
   bool to_ts_uuid_in_config = false;
   bool to_ts_uuid_is_a_voter = false;
@@ -948,26 +970,35 @@ Status AutoRebalancerTask::CheckMoveCompleted(
             "$0: source replica $1 does not have REPLACE attribute set",
             tablet_uuid, from_ts_uuid));
       }
-      // Replica to be removed is the leader.
-      // - It's possible that leadership changed and 'orig_leader_uuid' is not
-      //   the leader's UUID by the time 'cstate' was collected. Let's
-      //   cross-reference the two sources and only act if they agree.
-      // - It doesn't make sense to have the leader step down if the newly-added
-      //   replica hasn't been promoted to a voter yet, since changing
-      //   leadership can only delay that process and the stepped-down leader
-      //   replica will not be evicted until the newly added replica is promoted
-      //   to voter.
-      if (orig_leader_uuid == from_ts_uuid && orig_leader_uuid == cstate.leader_uuid()) {
-        LeaderStepDownRequestPB req;
-        LeaderStepDownResponsePB resp;
-        RpcController rpc;
-        req.set_dest_uuid(orig_leader_uuid);
-        req.set_tablet_id(tablet_uuid);
-        req.set_mode(LeaderStepDownMode::GRACEFUL);
-        rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-        RETURN_NOT_OK(proxy->LeaderStepDown(req, &resp, &rpc));
-        if (resp.has_error()) {
-          return StatusFromPB(resp.error().status());
+      // If the source is the current leader, step it down so the Raft group
+      // can evict it once the destination is promoted to voter. It doesn't
+      // make sense to step down before that promotion, since doing so only
+      // delays the process and the stepped-down leader will not be evicted
+      // until the newly added replica is promoted to voter.
+      if (from_ts_uuid == cstate.leader_uuid()) {
+        // Re-read the leader host/port from the catalog for the step-down RPC.
+        string leader_uuid;
+        HostPort leader_hp;
+        RETURN_NOT_OK(GetTabletLeader(tablet_uuid, &leader_uuid, &leader_hp));
+        // Only proceed if the catalog-reported leader still matches.
+        if (leader_uuid == from_ts_uuid) {
+          shared_ptr<TSDescriptor> desc;
+          if (!ts_manager_->LookupTSByUUID(leader_uuid, &desc)) {
+            return Status::NotFound("Could not find leader replica's tserver");
+          }
+          shared_ptr<ConsensusServiceProxy> proxy;
+          RETURN_NOT_OK(desc->GetConsensusProxy(messenger_, &proxy));
+          LeaderStepDownRequestPB req;
+          LeaderStepDownResponsePB resp;
+          RpcController rpc;
+          req.set_dest_uuid(from_ts_uuid);
+          req.set_tablet_id(tablet_uuid);
+          req.set_mode(LeaderStepDownMode::GRACEFUL);
+          rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+          RETURN_NOT_OK(proxy->LeaderStepDown(req, &resp, &rpc));
+          if (resp.has_error()) {
+            return StatusFromPB(resp.error().status());
+          }
         }
       }
 

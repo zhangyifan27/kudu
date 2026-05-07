@@ -838,6 +838,12 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                             TSInfosDict* ts_infos_dict,
                             const std::optional<std::string>& user);
 
+  // Retrieve the committed consensus state for the given tablet from the
+  // master's in-memory catalog. Caller must hold leader_lock_ for reading.
+  // Returns Status::NotFound if the tablet is unknown or has no consensus state.
+  Status GetTabletConsensusState(const std::string& tablet_id,
+                                 consensus::ConsensusStatePB* cstate) const;
+
   // Replace the given tablet with a new, empty one. The replaced tablet is
   // deleted and its data is permanently lost.
   Status ReplaceTablet(const std::string& tablet_id, master::ReplaceTabletResponsePB* resp);

@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex> // IWYU pragma: keep
 #include <string>
@@ -275,6 +276,7 @@ class TSDescriptor : public enable_make_shared<TSDescriptor> {
   void DecayRecentReplicaCreationsByTableUnlocked(const std::string& range_start_key);
 
   void AssignLocationForTesting(std::string loc) {
+    std::lock_guard l(lock_);
     location_ = std::move(loc);
   }
 

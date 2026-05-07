@@ -6680,6 +6680,24 @@ Status CatalogManager::GetTabletLocations(const string& tablet_id,
       tablet_info, filter, use_external_addr, locs_pb, ts_infos_dict);
 }
 
+Status CatalogManager::GetTabletConsensusState(const string& tablet_id,
+                                               ConsensusStatePB* cstate) const {
+  leader_lock_.AssertAcquiredForReading();
+  scoped_refptr<TabletInfo> tablet_info;
+  {
+    shared_lock l(lock_);
+    if (!FindCopy(tablet_map_, tablet_id, &tablet_info)) {
+      return Status::NotFound(Substitute("Unknown tablet $0", tablet_id));
+    }
+  }
+  TabletMetadataLock tablet_l(tablet_info.get(), LockMode::READ);
+  if (!tablet_l.data().pb.has_consensus_state()) {
+    return Status::NotFound(Substitute("No consensus state for tablet $0", tablet_id));
+  }
+  *cstate = tablet_l.data().pb.consensus_state();
+  return Status::OK();
+}
+
 Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletResponsePB* resp) {
   leader_lock_.AssertAcquiredForReading();
 

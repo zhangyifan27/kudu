@@ -65,6 +65,8 @@
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -72,9 +74,13 @@
 
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using kudu::consensus::BulkChangeConfigRequestPB;
+using kudu::consensus::ChangeConfigResponsePB;
+using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::consensus::GetConsensusStateRequestPB;
 using kudu::consensus::GetConsensusStateResponsePB;
+using kudu::consensus::MODIFY_PEER;
 using kudu::itest::GetTableLocations;
 using kudu::itest::ListTabletServers;
 using kudu::master::GetTableLocationsResponsePB;
@@ -265,6 +271,49 @@ class AutoRebalancerTest : public KuduTest {
       const optional<string>& location,
       rebalance::ClusterRawInfo* raw_info) {
     return auto_rebalancer->BuildClusterRawInfo(location, raw_info);
+  }
+
+  static Status CheckMoveCompletedForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const rebalance::Rebalancer::ReplicaMove& move,
+      bool* is_complete) {
+    return auto_rebalancer->CheckMoveCompleted(move, is_complete);
+  }
+
+  static void ExecuteMovesForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      vector<rebalance::Rebalancer::ReplicaMove>* moves) {
+    auto_rebalancer->ExecuteMoves(moves);
+  }
+
+  // Builds a thread-less AutoRebalancerTask wired to the same cluster as the
+  // live one. moves_per_tserver_ is only ever touched by the single live
+  // auto-rebalancer thread in production, so it carries no lock; driving
+  // ExecuteMoves() from the test thread against the live task would race that
+  // thread. The standalone task owns its own state and never starts a loop
+  // (Init() is not called), but reuses 'messenger_source's messenger so it can
+  // still issue the change-config RPCs that ExecuteMoves() needs.
+  static std::unique_ptr<AutoRebalancerTask> MakeStandaloneRebalancerForTest(
+      CatalogManager* catalog_manager,
+      TSManager* ts_manager,
+      AutoRebalancerTask* messenger_source) {
+    std::unique_ptr<AutoRebalancerTask> task(
+        new AutoRebalancerTask(catalog_manager, ts_manager));
+    task->messenger_ = messenger_source->messenger_;
+    return task;
+  }
+
+  static Status GetTabletLeaderForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const string& tablet_id,
+      string* leader_uuid,
+      HostPort* leader_hp) {
+    return auto_rebalancer->GetTabletLeader(tablet_id, leader_uuid, leader_hp);
+  }
+
+  static int MovesPerTserver(AutoRebalancerTask* auto_rebalancer,
+                             const string& ts_uuid) {
+    return auto_rebalancer->moves_per_tserver_[ts_uuid];
   }
 
   static Status BuildClusterInfoForTest(
@@ -1373,6 +1422,197 @@ TEST_F(AutoRebalancerTest, TestReplicaRebalancingMixedRFNoCrash) {
 
   ASSERT_OK(cluster_->AddTabletServer());
   NO_FATALS(CheckSomeMovesScheduled());
+}
+
+// Verify that CheckMoveCompleted returns is_complete=false (waits) when
+// CatalogManager's opid_index has not yet advanced past the value recorded
+// at scheduling time, i.e. the heartbeat carrying the new config hasn't
+// arrived yet.
+TEST_F(AutoRebalancerTest, CheckMoveCompletedWaitsWhileCatalogIsStale) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enabled = false;
+
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+
+  CreateWorkloadTable(/*num_tablets*/1, /*num_replicas*/3);
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* catalog = cluster_->mini_master(leader_idx)->master()->catalog_manager();
+  auto* auto_rebalancer = catalog->auto_rebalancer();
+
+  // Pick any tablet from the cluster.
+  rebalance::ClusterRawInfo raw_info;
+  string tablet_id;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info));
+    ASSERT_FALSE(raw_info.tablet_summaries.empty());
+    tablet_id = raw_info.tablet_summaries[0].id;
+  });
+
+  // Read the current opid_index from CatalogManager.
+  consensus::ConsensusStatePB cstate;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog);
+    ASSERT_OK(l.first_failed_status());
+    ASSERT_OK(catalog->GetTabletConsensusState(tablet_id, &cstate));
+  }
+  const int64_t current_opid_index = cstate.committed_config().opid_index();
+
+  // Construct a move whose config_opid_idx equals the current catalog index,
+  // simulating the state immediately after BulkChangeConfig was sent but
+  // before the master receives the heartbeat for the new config.
+  rebalance::Rebalancer::ReplicaMove move;
+  move.tablet_uuid = tablet_id;
+  move.ts_uuid_from = raw_info.tablet_summaries[0].replicas[0].ts_uuid;
+  // A fake destination is fine here: CheckMoveCompleted returns early at the
+  // opid_index freshness gate (before inspecting the destination UUID) because
+  // no BulkChangeConfig is sent in this test, so the opid_index never advances.
+  move.ts_uuid_to = "fake-destination-uuid";
+  move.config_opid_idx = current_opid_index;
+
+  bool is_complete = true;
+  ASSERT_OK(CheckMoveCompletedForTest(auto_rebalancer, move, &is_complete));
+  ASSERT_FALSE(is_complete) << "expected CheckMoveCompleted to wait while "
+                               "catalog opid_index has not advanced";
+}
+
+// Verify that a CAS rejection from BulkChangeConfig (caused by a concurrent
+// config change advancing the opid_index before ExecuteMoves sends its
+// request) is handled gracefully: the move is dropped as a scheduling
+// failure, per-tserver counters are not incremented, and the rebalancer
+// does not crash.
+TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enabled = false;
+
+  cluster_opts_.num_tablet_servers = 4;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+
+  CreateWorkloadTable(/*num_tablets*/1, /*num_replicas*/3);
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* catalog = cluster_->mini_master(leader_idx)->master()->catalog_manager();
+  auto* auto_rebalancer = catalog->auto_rebalancer();
+
+  // Drive ExecuteMoves() and inspect the move counters on a thread-less task to
+  // avoid racing the live auto-rebalancer thread on moves_per_tserver_.
+  auto standalone = MakeStandaloneRebalancerForTest(
+      catalog, cluster_->mini_master(leader_idx)->master()->ts_manager(),
+      auto_rebalancer);
+  auto* rebalancer = standalone.get();
+
+  // Wait for the cluster to stabilize and find a tablet with a known leader.
+  rebalance::ClusterRawInfo raw_info;
+  string tablet_id;
+  string src_ts_uuid;
+  string dst_ts_uuid;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(rebalancer, nullopt, &raw_info));
+    ASSERT_FALSE(raw_info.tablet_summaries.empty());
+    const auto& tablet = raw_info.tablet_summaries[0];
+    ASSERT_EQ(kudu::cluster_summary::HealthCheckResult::HEALTHY, tablet.result);
+    tablet_id = tablet.id;
+    // Pick the non-leader replica as the source.
+    for (const auto& r : tablet.replicas) {
+      if (!r.is_leader) {
+        src_ts_uuid = r.ts_uuid;
+        break;
+      }
+    }
+    ASSERT_FALSE(src_ts_uuid.empty());
+    // Find a tserver that holds no replica of this tablet to use as destination.
+    // With RF=3 and 4 tservers, exactly one tserver has no replica; we can't
+    // assume it's always index 3 since placement is non-deterministic.
+    unordered_set<string> replica_ts_uuids;
+    for (const auto& r : tablet.replicas) {
+      replica_ts_uuids.insert(r.ts_uuid);
+    }
+    dst_ts_uuid.clear();
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      const string& ts_uuid = cluster_->mini_tablet_server(i)->uuid();
+      if (!ContainsKey(replica_ts_uuids, ts_uuid)) {
+        dst_ts_uuid = ts_uuid;
+        break;
+      }
+    }
+    ASSERT_FALSE(dst_ts_uuid.empty());
+  });
+
+  // Read the current opid_index from CatalogManager.
+  consensus::ConsensusStatePB cstate;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog);
+    ASSERT_OK(l.first_failed_status());
+    ASSERT_OK(catalog->GetTabletConsensusState(tablet_id, &cstate));
+  }
+  const int64_t pre_opid_index = cstate.committed_config().opid_index();
+
+  // Advance the leader's committed config by sending a no-op BulkChangeConfig
+  // that sets replace=false on the source (already false — harmless, but
+  // advances the opid_index so any subsequent request with CAS = pre_opid_index
+  // will be rejected).
+  string leader_uuid;
+  HostPort leader_hp;
+  ASSERT_OK(GetTabletLeaderForTest(rebalancer, tablet_id, &leader_uuid, &leader_hp));
+  {
+    consensus::BulkChangeConfigRequestPB req;
+    auto* modify = req.add_config_changes();
+    modify->set_type(consensus::MODIFY_PEER);
+    modify->mutable_peer()->set_permanent_uuid(src_ts_uuid);
+    modify->mutable_peer()->mutable_attrs()->set_replace(false);
+    req.set_dest_uuid(leader_uuid);
+    req.set_tablet_id(tablet_id);
+    req.set_cas_config_opid_index(pre_opid_index);
+    consensus::ChangeConfigResponsePB resp;
+    rpc::RpcController rpc_ctrl;
+    rpc_ctrl.set_timeout(MonoDelta::FromSeconds(30));
+    vector<Sockaddr> resolved;
+    ASSERT_OK(leader_hp.ResolveAddresses(&resolved));
+    // Find the tserver index for the leader.
+    int leader_ts_idx = -1;
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      if (cluster_->mini_tablet_server(i)->uuid() == leader_uuid) {
+        leader_ts_idx = i;
+        break;
+      }
+    }
+    ASSERT_GE(leader_ts_idx, 0);
+    ASSERT_OK(cluster_->tserver_consensus_proxy(leader_ts_idx)->BulkChangeConfig(
+        req, &resp, &rpc_ctrl));
+    // The request may succeed or get a CAS error if the config already
+    // advanced; either way the opid_index is now > pre_opid_index.
+  }
+
+  // Construct a move with the stale pre_opid_index. ExecuteMoves reads
+  // CatalogManager's copy of the opid_index as the CAS value; since
+  // CatalogManager hasn't yet received the heartbeat carrying the new config,
+  // it still returns pre_opid_index, which the leader rejects.
+  vector<rebalance::Rebalancer::ReplicaMove> moves;
+  rebalance::Rebalancer::ReplicaMove move;
+  move.tablet_uuid = tablet_id;
+  move.ts_uuid_from = src_ts_uuid;
+  move.ts_uuid_to = dst_ts_uuid;
+  move.config_opid_idx = pre_opid_index;
+  moves.push_back(move);
+
+  // Capture the warning log to verify the failure is reported.
+  StringVectorSink sink;
+  ScopedRegisterSink reg(&sink);
+
+  ExecuteMovesForTest(rebalancer, &moves);
+
+  // The CAS-rejected move must be dropped from the vector.
+  ASSERT_TRUE(moves.empty()) << "expected CAS-rejected move to be dropped";
+
+  // Per-tserver counters must not have been incremented.
+  ASSERT_EQ(0, MovesPerTserver(rebalancer, src_ts_uuid));
+  ASSERT_EQ(0, MovesPerTserver(rebalancer, dst_ts_uuid));
+
+  // A warning should have been logged for the scheduling failure.
+  ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
 }
 
 } // namespace master
