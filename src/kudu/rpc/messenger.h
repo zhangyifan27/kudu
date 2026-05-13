@@ -470,7 +470,7 @@ class Messenger final {
 
   const std::string& keytab_file() const { return keytab_file_; }
 
-  const scoped_refptr<RpcService> rpc_service(const std::string& service_name) const;
+  scoped_refptr<RpcService> rpc_service(const std::string& service_name) const;
 
  private:
   friend class MessengerBuilder;

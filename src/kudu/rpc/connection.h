@@ -219,7 +219,7 @@ class Connection : public RefCountedThreadSafe<Connection> {
   Socket* socket() { return socket_.get(); }
 
   // Go through the process of transferring control of the underlying socket back to the Reactor.
-  void CompleteNegotiation(Status negotiation_status,
+  void CompleteNegotiation(const Status& negotiation_status,
                            std::unique_ptr<ErrorStatusPB> rpc_error);
 
   // Indicate that negotiation is complete and that the Reactor is now in control of the socket.
@@ -267,7 +267,6 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
  private:
   friend struct CallAwaitingResponse;
-  friend class QueueTransferTask;
   friend struct CallTransferCallbacks;
   friend struct ResponseTransferCallbacks;
 

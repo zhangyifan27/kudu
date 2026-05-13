@@ -24,6 +24,7 @@
 #include <set>
 #include <string>
 
+#include <boost/function.hpp>
 #include <boost/intrusive/detail/list_iterator.hpp>
 #include <boost/intrusive/list.hpp>
 #include <ev.h>
@@ -486,29 +487,6 @@ struct ResponseTransferCallbacks final : public TransferCallbacks {
   bool notified_;
 };
 
-// Reactor task which puts a transfer on the outbound transfer queue.
-class QueueTransferTask : public ReactorTask {
- public:
-  QueueTransferTask(unique_ptr<OutboundTransfer> transfer, Connection* conn)
-      : transfer_(std::move(transfer)),
-        conn_(conn) {
-  }
-
-  void Run(ReactorThread* /*thr*/) override {
-    conn_->QueueOutbound(std::move(transfer_));
-    delete this;
-  }
-
-  void Abort(const Status& status) override {
-    transfer_->Abort(status);
-    delete this;
-  }
-
- private:
-  unique_ptr<OutboundTransfer> transfer_;
-  Connection* conn_;
-};
-
 void Connection::QueueResponseForCall(unique_ptr<InboundCall> call) {
   // This is usually called by the IPC worker thread when the response
   // is set, but in some circumstances may also be called by the
@@ -527,8 +505,21 @@ void Connection::QueueResponseForCall(unique_ptr<InboundCall> call) {
   // After the response is sent, can delete the InboundCall object.
   // We set a dummy call ID and required feature set, since these are not needed
   // when sending responses.
+
   auto t(OutboundTransfer::CreateForCallResponse(std::move(tmp_slices), std::move(cb)));
-  reactor_thread_->reactor()->ScheduleReactorTask(new QueueTransferTask( std::move(t), this));
+  // Move capture couldn't help since it's necessary to pass the pointer
+  // to both lambdas.
+  auto* t_raw = t.release();
+  ReactorTask task{
+    [this, t_raw](ReactorThread* /*rt*/) {
+      this->QueueOutbound(unique_ptr<OutboundTransfer>(t_raw));
+    },
+    [t_raw](const Status& s) {
+      t_raw->Abort(s);
+      delete t_raw;
+    },
+  };
+  reactor_thread_->reactor()->ScheduleReactorTask(std::move(task));
 }
 
 void Connection::set_confidential(bool is_confidential) {
@@ -805,42 +796,24 @@ string Connection::ToString() const {
                         : "client connection to", remote_.ToString());
 }
 
-// Reactor task that transitions this Connection from connection negotiation to
-// regular RPC handling. Destroys Connection on negotiation error.
-class NegotiationCompletedTask : public ReactorTask {
- public:
-  NegotiationCompletedTask(Connection* conn,
-                           Status negotiation_status,
-                           std::unique_ptr<ErrorStatusPB> rpc_error)
-      : conn_(conn),
-        negotiation_status_(std::move(negotiation_status)),
-        rpc_error_(std::move(rpc_error)) {
-  }
-
-  void Run(ReactorThread* rthread) override {
-    rthread->CompleteConnectionNegotiation(conn_,
-                                           negotiation_status_,
-                                           std::move(rpc_error_));
-    delete this;
-  }
-
-  void Abort(const Status& status) override {
-    DCHECK(conn_->reactor_thread()->reactor()->closing());
-    VLOG(1) << Substitute("connection negotiation aborted: $0", status.ToString());
-    delete this;
-  }
-
- private:
-  scoped_refptr<Connection> conn_;
-  const Status negotiation_status_;
-  std::unique_ptr<ErrorStatusPB> rpc_error_;
-};
-
-void Connection::CompleteNegotiation(Status negotiation_status,
+void Connection::CompleteNegotiation(const Status& negotiation_status,
                                      unique_ptr<ErrorStatusPB> rpc_error) {
-  auto task = new NegotiationCompletedTask(
-      this, std::move(negotiation_status), std::move(rpc_error));
-  reactor_thread_->reactor()->ScheduleReactorTask(task);
+  // The lambdas below need to hold a reference to the connection in case
+  // it has been closed before the task gets scheduled/aborted.
+  scoped_refptr<Connection> reffed_this(this);
+  auto* rpc_error_raw = rpc_error.release();
+  ReactorTask task{
+    [=](ReactorThread* rt) {
+      rt->CompleteConnectionNegotiation(reffed_this.get(),
+                                        negotiation_status,
+                                        unique_ptr<ErrorStatusPB>(rpc_error_raw));
+    },
+    [=](const Status& /*s*/) {
+      DCHECK(reffed_this->reactor_thread()->reactor()->closing());
+      delete rpc_error_raw;
+    },
+  };
+  reactor_thread_->reactor()->ScheduleReactorTask(std::move(task));
 }
 
 void Connection::MarkNegotiationComplete() {

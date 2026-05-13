@@ -342,7 +342,7 @@ void Negotiation::RunNegotiation(const scoped_refptr<Connection>& conn,
   if (conn->direction() == Connection::SERVER && s.IsNotAuthorized()) {
     LOG(WARNING) << "Unauthorized connection attempt: " << s.message().ToString();
   }
-  conn->CompleteNegotiation(std::move(s), std::move(rpc_error));
+  conn->CompleteNegotiation(s, std::move(rpc_error));
 }
 
 
