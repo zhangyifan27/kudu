@@ -153,6 +153,9 @@ class Rebalancer {
     std::string ts_uuid_from;
     std::string ts_uuid_to;
     std::optional<int64_t> config_opid_idx; // for CAS-enabled Raft changes
+    // True when FindReplicas() fell back to the leader-replica list because no
+    // follower candidates were available for the source tablet server.
+    bool is_leader_move = false;
   };
 
   enum class RunStatus {
@@ -183,9 +186,13 @@ class Rebalancer {
   // of the 'tablet_ids' container and tablet server UUIDs TableReplicaMove::from
   // and TableReplica::to correspondingly. If no suitable tablet replicas are found,
   // 'tablet_ids' will be empty.
-  void FindReplicas(const TableReplicaMove& move,
+  //
+  // Returns true if the candidates came from the leader-fallback path (i.e., no
+  // non-leader replicas were available on the source server and the function
+  // resorted to leader replicas). Returns false when follower replicas were used.
+  bool FindReplicas(const TableReplicaMove& move,
                     const ClusterRawInfo& raw_info,
-                    std::vector<std::string>* tablet_ids);
+                    std::vector<std::string>* tablet_ids) const;
 
   // Convert the 'raw' information about the cluster into information suitable
   // for the input of the high-level rebalancing algorithm.
@@ -294,7 +301,8 @@ Status SelectReplicaToMove(
     std::mt19937* random_generator,
     std::vector<std::string> tablet_ids,
     std::unordered_set<std::string>* tablets_in_move,
-    std::vector<Rebalancer::ReplicaMove>* replica_moves);
+    std::vector<Rebalancer::ReplicaMove>* replica_moves,
+    bool is_leader_move);
 
 } // namespace rebalance
 } // namespace kudu

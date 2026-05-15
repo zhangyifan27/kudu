@@ -112,9 +112,9 @@ Rebalancer::Rebalancer(Config config)
 // replicas of affected tablets would make the client to re-resolve new leaders
 // and retry the operations. Moving leader replicas is used as last resort
 // when no other candidates are left.
-void Rebalancer::FindReplicas(const TableReplicaMove& move,
+bool Rebalancer::FindReplicas(const TableReplicaMove& move,
                               const ClusterRawInfo& raw_info,
-                              vector<string>* tablet_ids) {
+                              vector<string>* tablet_ids) const {
   const bool is_range_rebalancing = config_.enable_range_rebalancing;
   const auto& table_id = move.table_id;
   const auto& tag = move.tag;
@@ -178,7 +178,7 @@ void Rebalancer::FindReplicas(const TableReplicaMove& move,
     // If there are tablets with non-leader replicas at the source server,
     // those are the best candidates for movement.
     tablet_ids->swap(tablet_uuids);
-    return;
+    return false;
   }
 
   // If no tablets with non-leader replicas were found, resort to tablets with
@@ -191,6 +191,7 @@ void Rebalancer::FindReplicas(const TableReplicaMove& move,
       inserter(tablet_uuids, tablet_uuids.begin()));
 
   tablet_ids->swap(tablet_uuids);
+  return true;
 }
 
 void Rebalancer::FilterMoves(const MovesInProgress& scheduled_moves,
@@ -568,7 +569,8 @@ Status SelectReplicaToMove(
     std::mt19937* random_generator,
     vector<string> tablet_ids,
     unordered_set<string>* tablets_in_move,
-    vector<Rebalancer::ReplicaMove>* replica_moves) {
+    vector<Rebalancer::ReplicaMove>* replica_moves,
+    bool is_leader_move) {
 
   // Shuffle the set of the tablet identifiers: that's to achieve even spread
   // of moves across tables with the same skew.
@@ -591,6 +593,7 @@ Status SelectReplicaToMove(
   Rebalancer::ReplicaMove move_info;
   move_info.tablet_uuid = move_tablet_id;
   move_info.ts_uuid_from = move.from;
+  move_info.is_leader_move = is_leader_move;
   const auto& extra_info = FindOrDie(extra_info_by_tablet_id, move_tablet_id);
   if (extra_info.replication_factor < extra_info.num_voters) {
     // The number of voter replicas is greater than the target replication

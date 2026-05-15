@@ -130,6 +130,9 @@ DECLARE_uint32(auto_rebalancing_wait_for_replica_moves_seconds);
 METRIC_DECLARE_gauge_int32(tablet_copy_open_client_sessions);
 METRIC_DECLARE_counter(tablet_copy_bytes_fetched);
 METRIC_DECLARE_counter(tablet_copy_bytes_sent);
+METRIC_DECLARE_counter(auto_rebalancer_leader_moves_scheduled);
+METRIC_DECLARE_counter(auto_rebalancer_follower_moves_scheduled);
+METRIC_DECLARE_counter(auto_rebalancer_rounds_completed);
 
 namespace {
 
@@ -296,9 +299,10 @@ class AutoRebalancerTest : public KuduTest {
   static std::unique_ptr<AutoRebalancerTask> MakeStandaloneRebalancerForTest(
       CatalogManager* catalog_manager,
       TSManager* ts_manager,
+      const scoped_refptr<MetricEntity>& metric_entity,
       AutoRebalancerTask* messenger_source) {
     std::unique_ptr<AutoRebalancerTask> task(
-        new AutoRebalancerTask(catalog_manager, ts_manager));
+        new AutoRebalancerTask(catalog_manager, ts_manager, metric_entity));
     task->messenger_ = messenger_source->messenger_;
     return task;
   }
@@ -406,6 +410,16 @@ class AutoRebalancerTest : public KuduTest {
     DCHECK(cluster_ != nullptr);
     return cluster_->mini_master(master_idx)->master()->catalog_manager()->
         auto_rebalancer()->moves_attempted_this_round_for_test_;
+  }
+
+  int64_t GetMasterCounterValue(CounterPrototype* prototype) const {
+    int leader_idx;
+    CHECK_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+    // Instantiate() is idempotent: it returns the existing counter instance
+    // when the metric has already been registered by the AutoRebalancerTask
+    // constructor, so this does not create a fresh zeroed counter.
+    return prototype->Instantiate(
+        cluster_->mini_master(leader_idx)->master()->metric_entity())->value();
   }
 
   int NumMovesScheduled(int master_idx,
@@ -1501,6 +1515,7 @@ TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
   // avoid racing the live auto-rebalancer thread on moves_per_tserver_.
   auto standalone = MakeStandaloneRebalancerForTest(
       catalog, cluster_->mini_master(leader_idx)->master()->ts_manager(),
+      cluster_->mini_master(leader_idx)->master()->metric_entity(),
       auto_rebalancer);
   auto* rebalancer = standalone.get();
 
@@ -1613,6 +1628,83 @@ TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
 
   // A warning should have been logged for the scheduling failure.
   ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
+}
+
+// Verify follower-move counter increments and leader-move counter stays zero
+// when prefer_follower is enabled and RF=3 tablets (which always have followers)
+// need to be rebalanced after adding a tserver.
+TEST_F(AutoRebalancerTest, RebalancerMetricsFollowerMoves) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_prefer_follower_replica_moves = true;
+
+  constexpr int kNumTServers = 3;
+  constexpr int kNumTablets = 4;
+
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  // Create a balanced RF=3 workload so we have real followers to move.
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  NO_FATALS(CheckNoMovesScheduled());
+
+  // Snapshot rounds_completed before adding the tserver.
+  const int64_t rounds_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed);
+
+  // Adding a tserver unbalances the cluster and should trigger moves. Wait
+  // until at least one full round has completed so that rounds_completed_ is
+  // stable before we snapshot the counters.
+  ASSERT_OK(cluster_->AddTabletServer());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_GT(GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled), 0);
+    ASSERT_GT(GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed), rounds_before);
+  });
+
+  const int64_t follower = GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled);
+  const int64_t leader = GetMasterCounterValue(&METRIC_auto_rebalancer_leader_moves_scheduled);
+  const int64_t rounds = GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed);
+
+  // With prefer_follower=true and RF=3, all moves should be follower moves.
+  ASSERT_GT(follower, 0);
+  ASSERT_EQ(0, leader);
+
+  // At least one full rebalancing round must have completed since we started.
+  ASSERT_GT(rounds, rounds_before);
+}
+
+// In a stable, balanced cluster the rebalancer completes full rounds without
+// scheduling any moves. Verify that rounds_completed keeps incrementing while
+// the leader and follower move counters remain unchanged.
+TEST_F(AutoRebalancerTest, RebalancerMetricsRoundsInStableCluster) {
+  constexpr int kNumTServers = 3;
+  constexpr int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  NO_FATALS(CheckNoMovesScheduled());
+
+  const int64_t rounds_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed);
+  const int64_t leader_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_leader_moves_scheduled);
+  const int64_t follower_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled);
+
+  // Wait for several more full rounds so the increment is unambiguous.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_GT(GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed),
+              rounds_before + 2);
+  });
+
+  // A balanced cluster must not schedule any moves.
+  ASSERT_EQ(leader_before,
+            GetMasterCounterValue(&METRIC_auto_rebalancer_leader_moves_scheduled));
+  ASSERT_EQ(follower_before,
+            GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled));
 }
 
 } // namespace master

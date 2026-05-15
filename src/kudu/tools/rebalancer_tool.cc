@@ -1207,7 +1207,12 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
             });
   for (const auto& move : moves) {
     vector<string> tablet_ids;
-    rebalancer_->FindReplicas(move, raw_info, &tablet_ids);
+    const bool is_leader_fallback = rebalancer_->FindReplicas(move, raw_info, &tablet_ids);
+    if (is_leader_fallback) {
+      LOG(WARNING) << Substitute(
+          "table $0: no follower replicas available on $1, falling back to leader replicas",
+          move.table_id, move.from);
+    }
     if (!loc) {
       // In case of cross-location (a.k.a. inter-location) rebalancing it is
       // necessary to make sure the majority of replicas would not end up
@@ -1220,7 +1225,8 @@ Status RebalancerTool::AlgoBasedRunner::GetNextMovesImpl(
     // In that case, we just continue through the loop.
     WARN_NOT_OK(SelectReplicaToMove(move, extra_info_by_tablet_id,
                                     &random_generator_, std::move(tablet_ids),
-                                    &tablets_in_move, replica_moves),
+                                    &tablets_in_move, replica_moves,
+                                    /*is_leader_move=*/false),
                 "No replica could be moved this iteration");
   }
 

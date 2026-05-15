@@ -202,7 +202,11 @@ Status FindBestReplicaToReplace(
   }
   CHECK(!replica_id.empty());
 
-  *replica_to_replace = { tablet_id, replica_id, "", tablet_info.config_idx };
+  // The loop above prefers a non-leader, so this is normally false. Set it
+  // explicitly so the leader/follower move counters don't rely on the default.
+  const bool is_leader_move = (replica_id == ts_id_leader_replica);
+  *replica_to_replace = {
+      tablet_id, replica_id, "", tablet_info.config_idx, is_leader_move };
   return Status::OK();
 }
 

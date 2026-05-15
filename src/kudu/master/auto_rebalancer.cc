@@ -61,6 +61,7 @@
 #include "kudu/util/cow_object.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/hexdump.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -167,12 +168,35 @@ TAG_FLAG(auto_rebalancing_enable_range_rebalancing, runtime);
 
 DECLARE_bool(auto_rebalancing_enabled);
 
+METRIC_DEFINE_counter(server, auto_rebalancer_leader_moves_scheduled,
+                      "Auto-Rebalancer Leader Moves Scheduled",
+                      kudu::MetricUnit::kTablets,
+                      "Number of replica moves scheduled by the auto-rebalancer "
+                      "where the source replica was the Raft leader (follower "
+                      "candidates were unavailable on the source tablet server).",
+                      kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_counter(server, auto_rebalancer_follower_moves_scheduled,
+                      "Auto-Rebalancer Follower Moves Scheduled",
+                      kudu::MetricUnit::kTablets,
+                      "Number of replica moves scheduled by the auto-rebalancer "
+                      "where the source replica was a non-leader follower.",
+                      kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_counter(server, auto_rebalancer_rounds_completed,
+                      "Auto-Rebalancer Rounds Completed",
+                      kudu::MetricUnit::kUnits,
+                      "Number of full rebalancing cycles completed by the "
+                      "auto-rebalancer.",
+                      kudu::MetricLevel::kInfo);
+
 namespace kudu {
 
 namespace master {
 
 AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
-                                       TSManager* ts_manager)
+                                       TSManager* ts_manager,
+                                       const scoped_refptr<MetricEntity>& metric_entity)
     : catalog_manager_(catalog_manager),
       ts_manager_(ts_manager),
       shutdown_(1),
@@ -194,6 +218,11 @@ AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
       /*intra_location_rebalancing_concurrency*/0,
       FLAGS_auto_rebalancing_enable_range_rebalancing))),
       random_generator_(random_device_()),
+      leader_moves_scheduled_(METRIC_auto_rebalancer_leader_moves_scheduled.Instantiate(
+          metric_entity)),
+      follower_moves_scheduled_(METRIC_auto_rebalancer_follower_moves_scheduled.Instantiate(
+          metric_entity)),
+      rounds_completed_(METRIC_auto_rebalancer_rounds_completed.Instantiate(metric_entity)),
       number_of_loop_iterations_for_test_(0),
       moves_attempted_this_round_for_test_(0),
       moves_scheduled_this_round_for_test_(0) {
@@ -308,6 +337,9 @@ void AutoRebalancerTask::RunLoop() {
                                  << " moves after all operations completed";
     }
 #endif
+    // Only rounds that run to completion reach here; early-continue paths
+    // (BuildClusterRawInfo, GetMoves failures, etc.) skip this increment.
+    rounds_completed_->Increment();
   }
 }
 
@@ -432,7 +464,7 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
     }
 
     vector<string> tablet_ids;
-    rebalancer_.FindReplicas(move, raw_info, &tablet_ids);
+    const bool is_leader_move = rebalancer_.FindReplicas(move, raw_info, &tablet_ids);
     if (cross_location == CrossLocations::YES) {
       // In case of cross-location (a.k.a. inter-location) rebalancing it is
       // necessary to make sure the majority of replicas would not end up
@@ -444,7 +476,8 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
 
     RETURN_NOT_OK(SelectReplicaToMove(move, extra_info_by_tablet_id,
                                       &random_generator_, std::move(tablet_ids),
-                                      &tablets_in_move, &rep_moves));
+                                      &tablets_in_move, &rep_moves,
+                                      is_leader_move));
   }
 
   *replica_moves = std::move(rep_moves);
@@ -575,6 +608,11 @@ void AutoRebalancerTask::ExecuteMoves(
       moves_per_tserver_[src_ts_uuid]++;
       if (!dst_ts_uuid.empty()) {
         moves_per_tserver_[dst_ts_uuid]++;
+      }
+      if (move_info.is_leader_move) {
+        leader_moves_scheduled_->Increment();
+      } else {
+        follower_moves_scheduled_->Increment();
       }
       VLOG(1) << Substitute(
           "Scheduled move: tablet $0 from $1 to $2 "

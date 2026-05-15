@@ -32,7 +32,9 @@
 
 namespace kudu {
 
+class Counter;
 class HostPort;
+class MetricEntity;
 class Thread;
 
 namespace rebalance {
@@ -65,7 +67,9 @@ enum CrossLocations {
 class AutoRebalancerTask {
  public:
 
-  AutoRebalancerTask(CatalogManager* catalog_manager, TSManager* ts_manager);
+  AutoRebalancerTask(CatalogManager* catalog_manager,
+                     TSManager* ts_manager,
+                     const scoped_refptr<MetricEntity>& metric_entity);
   ~AutoRebalancerTask();
 
   // Initializes the auto-rebalancer.
@@ -191,6 +195,11 @@ class AutoRebalancerTask {
   // Track the number of ongoing moves per tablet server (both source and destination).
   // Key is the tserver UUID, value is the count of ongoing moves.
   std::unordered_map<std::string, int> moves_per_tserver_;
+
+  // Observability counters.
+  scoped_refptr<Counter> leader_moves_scheduled_;
+  scoped_refptr<Counter> follower_moves_scheduled_;
+  scoped_refptr<Counter> rounds_completed_;
 
   // Variables for testing.
   std::atomic<int> number_of_loop_iterations_for_test_;

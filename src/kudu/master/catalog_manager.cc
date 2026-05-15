@@ -1049,7 +1049,8 @@ Status CatalogManager::Init(bool is_first_run) {
   RETURN_NOT_OK_PREPEND(sys_catalog_->WaitUntilRunning(),
                         "Failed waiting for the catalog tablet to run");
 
-  unique_ptr<AutoRebalancerTask> task(new AutoRebalancerTask(this, master_->ts_manager()));
+  unique_ptr<AutoRebalancerTask> task(
+      new AutoRebalancerTask(this, master_->ts_manager(), master_->metric_entity()));
   RETURN_NOT_OK_PREPEND(task->Init(), "failed to initialize auto-rebalancing task");
   auto_rebalancer_ = std::move(task);
 
