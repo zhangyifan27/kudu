@@ -109,6 +109,7 @@ DECLARE_string(env_inject_eio_globs);
 DECLARE_uint64(log_container_preallocate_bytes);
 DECLARE_uint64(log_container_max_size);
 DECLARE_uint64(log_container_metadata_max_size);
+DECLARE_uint64(log_container_metadata_inmem_replay_threshold_bytes);
 DECLARE_bool(log_container_metadata_runtime_compact);
 DECLARE_double(log_container_metadata_size_before_compact_ratio);
 DECLARE_int32(log_block_manager_inject_latency_load_container_ms);
@@ -1186,11 +1187,9 @@ TEST_P(LogBlockManagerTest, StartupBenchmark) {
           to_delete_count / FLAGS_startup_benchmark_batch_count_for_testing;
       shared_ptr<BlockDeletionTransaction> deletion_transaction =
           this->bm_->NewDeletionTransaction();
-      for (; j < block_ids.size(); j++) {
+      for (; j < block_ids.size() && to_delete_count_per_batch > 0; j++) {
         deletion_transaction->AddDeletedBlock(block_ids[j]);
-        if (--to_delete_count_per_batch <= 0) {
-          break;
-        }
+        --to_delete_count_per_batch;
       }
       ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
     }
@@ -1207,6 +1206,136 @@ TEST_P(LogBlockManagerTest, StartupBenchmark) {
   for (int i = 0; i < FLAGS_startup_benchmark_reopen_times; i++) {
     SCOPED_LOG_TIMING(INFO, "reopening block manager");
     ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs));
+  }
+  LOG(INFO) << "Test on --block_manager=" << FLAGS_block_manager;
+}
+
+// A/B micro-benchmark for the in-memory metadata replay optimization
+// introduced by --log_container_metadata_inmem_replay_threshold_bytes.
+//
+// The test populates the LBM with the same set of containers/records that
+// StartupBenchmark uses, then reopens the block manager twice:
+//   pass 1: --log_container_metadata_inmem_replay_threshold_bytes = 0
+//           (streaming, two preadv()s per record - the pre-optimization
+//            baseline);
+//   pass 2: --log_container_metadata_inmem_replay_threshold_bytes = 64MiB
+//           (in-memory replay, one bulk read per container - the optimized
+//            path).
+// Both passes run FLAGS_startup_benchmark_reopen_times reopens and use
+// SCOPED_LOG_TIMING; the resulting wall-clock numbers can be compared
+// directly. The optimization only applies to native-meta containers and
+// non-encrypted clusters, so this test is hung off LogBlockManagerNativeMetaTest
+// and skips when encryption is enabled.
+TEST_P(LogBlockManagerNativeMetaTest, InMemoryReplayStartupBenchmark) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  if (std::get<0>(GetParam())) {
+    LOG(INFO) << "Encryption is enabled, in-memory replay falls back to "
+                 "streaming; skipping benchmark.";
+    GTEST_SKIP();
+  }
+
+  google::FlagSaver flag_saver;
+
+  // Same preflush-disable trick as StartupBenchmark.
+  FLAGS_block_manager_preflush_control = "never";
+
+  vector<string> test_dirs;
+  {
+    SCOPED_LOG_TIMING(INFO, "init environment");
+    for (int i = 0; i < FLAGS_startup_benchmark_data_dir_count_for_testing; ++i) {
+      test_dirs.emplace_back(test_dir_ + "/" + std::to_string(i));
+    }
+    ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs, /* force= */ true));
+  }
+
+  vector<BlockId> block_ids;
+  block_ids.reserve(FLAGS_startup_benchmark_batch_count_for_testing *
+                    FLAGS_startup_benchmark_block_count_per_batch_for_testing);
+  {
+    SCOPED_LOG_TIMING(INFO, "create blocks");
+    for (int i = 0; i < FLAGS_startup_benchmark_batch_count_for_testing; i++) {
+      unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
+      for (int j = 0; j < FLAGS_startup_benchmark_block_count_per_batch_for_testing; j++) {
+        unique_ptr<WritableBlock> block;
+        ASSERT_OK_FAST(bm_->CreateBlock(test_block_opts_, &block));
+        ASSERT_OK_FAST(block->Append("x"));
+        ASSERT_OK_FAST(block->Finalize());
+        block_ids.emplace_back(block->id());
+        transaction->AddCreatedBlock(std::move(block));
+      }
+      ASSERT_OK(transaction->CommitCreatedBlocks());
+    }
+  }
+
+  int to_delete_count =
+      block_ids.size() * FLAGS_startup_benchmark_deleted_block_percentage / 100;
+  if (to_delete_count > 0) {
+    std::mt19937 gen(SeedRandom());
+    std::shuffle(block_ids.begin(), block_ids.end(), gen);
+
+    SCOPED_LOG_TIMING(INFO, "delete blocks");
+    int j = 0;
+    for (int i = 0; i < FLAGS_startup_benchmark_batch_count_for_testing; i++) {
+      int to_delete_count_per_batch =
+          to_delete_count / FLAGS_startup_benchmark_batch_count_for_testing;
+      shared_ptr<BlockDeletionTransaction> deletion_transaction =
+          this->bm_->NewDeletionTransaction();
+      for (; j < block_ids.size() && to_delete_count_per_batch > 0; j++) {
+        deletion_transaction->AddDeletedBlock(block_ids[j]);
+        --to_delete_count_per_batch;
+      }
+      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
+    }
+  }
+
+  // Drain pending hole-punches before timing reopen, otherwise their cost
+  // bleeds into the first pass.
+  {
+    SCOPED_LOG_TIMING(INFO, "shutdown block manager");
+    bm_.reset();
+  }
+
+  // Pick any block that is guaranteed to be alive after the deletion loop
+  // above: after shuffling, the first 'to_delete_count' entries are deleted,
+  // so the tail of 'block_ids' survives. We use it for a per-pass sanity
+  // OpenBlock so the benchmark does not just measure replay but also verifies
+  // that the reopened LBM can actually serve a block.
+  BlockId sanity_block_id;
+  if (to_delete_count < static_cast<int>(block_ids.size())) {
+    sanity_block_id = block_ids.back();
+  }
+  auto sanity_open = [&]() {
+    if (sanity_block_id.IsNull()) return;
+    unique_ptr<ReadableBlock> rb;
+    ASSERT_OK(this->bm_->OpenBlock(sanity_block_id, &rb));
+  };
+
+  // Pass 1: streaming baseline (optimization disabled).
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 0;
+    LOG(INFO) << "InMemoryReplayStartupBenchmark: pass 1 (streaming, "
+                 "--log_container_metadata_inmem_replay_threshold_bytes=0)";
+    for (int i = 0; i < FLAGS_startup_benchmark_reopen_times; i++) {
+      SCOPED_LOG_TIMING(INFO, "reopening block manager [streaming]");
+      ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs));
+      NO_FATALS(sanity_open());
+    }
+    // Shutdown so pass 2 starts from the same on-disk state.
+    bm_.reset();
+  }
+
+  // Pass 2: in-memory replay (optimization enabled at the default 64 MiB).
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 64ULL * 1024 * 1024;
+    LOG(INFO) << "InMemoryReplayStartupBenchmark: pass 2 (in-memory, "
+                 "--log_container_metadata_inmem_replay_threshold_bytes=64MiB)";
+    for (int i = 0; i < FLAGS_startup_benchmark_reopen_times; i++) {
+      SCOPED_LOG_TIMING(INFO, "reopening block manager [in-memory]");
+      ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs));
+      NO_FATALS(sanity_open());
+    }
   }
   LOG(INFO) << "Test on --block_manager=" << FLAGS_block_manager;
 }
@@ -1926,6 +2055,76 @@ TEST_P(LogBlockManagerNativeMetaTest, TestCompactFullContainerMetadataAtStartup)
   FsReport report;
   ASSERT_OK(ReopenBlockManager(nullptr, &report));
   ASSERT_EQ(last_live_aligned_bytes, report.stats.live_block_bytes_aligned);
+}
+
+// Exercises the in-memory metadata replay optimization for the native-meta
+// log block manager: at startup, when
+// --log_container_metadata_inmem_replay_threshold_bytes is non-zero and the
+// metadata file's payload fits within it, each container's metadata file is
+// slurped into memory once and replayed from there, instead of issuing two
+// preads per record.
+//
+// This test verifies that all three regimes (in-memory enabled, forced
+// fallback because the file is larger than the threshold, and feature
+// disabled) produce identical, correct results.
+TEST_P(LogBlockManagerNativeMetaTest, TestInMemoryMetadataReplay) {
+  google::FlagSaver flag_saver;
+
+  // Create enough blocks to populate the metadata file with many records.
+  // Using a single container keeps the test focused on the replay path.
+  FLAGS_log_container_max_blocks = 1000;
+  const int kNumBlocks = 200;
+
+  vector<BlockId> block_ids;
+  block_ids.reserve(kNumBlocks);
+  for (int i = 0; i < kNumBlocks; i++) {
+    unique_ptr<WritableBlock> block;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &block));
+    ASSERT_OK(block->Append("hello"));
+    ASSERT_OK(block->Close());
+    block_ids.emplace_back(block->id());
+  }
+
+  // Delete a fraction of blocks so the metadata also contains DELETE records.
+  {
+    shared_ptr<BlockDeletionTransaction> deletion_transaction =
+        bm_->NewDeletionTransaction();
+    for (int i = 0; i < kNumBlocks; i += 3) {
+      deletion_transaction->AddDeletedBlock(block_ids[i]);
+    }
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
+  }
+
+  // Helper: reopen and verify that every still-live block is readable and
+  // every deleted block is no longer visible to the LBM.
+  auto verify_blocks_readable = [&]() {
+    ASSERT_OK(ReopenBlockManager());
+    for (int i = 0; i < kNumBlocks; i++) {
+      unique_ptr<ReadableBlock> rb;
+      Status s = bm_->OpenBlock(block_ids[i], &rb);
+      if (i % 3 == 0) {
+        // Deleted above: the LBM must report it as gone.
+        ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+        continue;
+      }
+      ASSERT_OK(s);
+      uint64_t sz = 0;
+      ASSERT_OK(rb->Size(&sz));
+      ASSERT_EQ(5, sz);
+    }
+  };
+
+  // 1) Default-sized in-memory replay (file is well below 64 MiB).
+  FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 64ULL * 1024 * 1024;
+  NO_FATALS(verify_blocks_readable());
+
+  // 2) Force the streaming fallback by setting the threshold to 1 byte.
+  FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 1;
+  NO_FATALS(verify_blocks_readable());
+
+  // 3) Disable the optimization entirely.
+  FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 0;
+  NO_FATALS(verify_blocks_readable());
 }
 
 // Regression test for a bug in which, after a metadata file was compacted,

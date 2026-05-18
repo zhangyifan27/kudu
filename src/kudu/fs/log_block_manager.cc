@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -70,6 +71,7 @@
 #include "kudu/util/atomic-utils.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/file_cache.h"
 #include "kudu/util/flag_tags.h"
@@ -161,6 +163,24 @@ DEFINE_double(log_container_metadata_size_before_compact_ratio, 0.80,
               "metadata will be compacted.");
 TAG_FLAG(log_container_metadata_size_before_compact_ratio, advanced);
 TAG_FLAG(log_container_metadata_size_before_compact_ratio, experimental);
+
+DEFINE_uint64(log_container_metadata_inmem_replay_threshold_bytes,
+              64ULL * 1024 * 1024,
+              "When loading a log block container's metadata file at startup, if the "
+              "file's payload size (excluding any encryption header) is less than or "
+              "equal to this many bytes, the entire file will be slurped into memory "
+              "in a single read and replayed from the in-memory buffer instead of "
+              "issuing two preadv() syscalls per record (one for the length+checksum "
+              "prefix and one for the body+checksum). This trades a small transient memory "
+              "spike per concurrently-loading container for a large reduction in the "
+              "number of syscalls performed during 'Reading filesystem' at startup. "
+              "Set to 0 to disable and always use the streaming code path. Only "
+              "applies to --block_manager='log' (native metadata); encrypted metadata "
+              "files are not supported by this optimization in the current version and "
+              "always use the streaming code path regardless of this flag.");
+TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, advanced);
+TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, experimental);
+TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, runtime);
 
 DEFINE_bool(log_block_manager_test_hole_punching, true,
             "Ensure hole punching is supported by the underlying filesystem");
@@ -1396,6 +1416,141 @@ Status LogBlockContainer::TruncateDataToNextBlockOffset() {
   return Status::OK();
 }
 
+namespace {
+
+// A RandomAccessFile implementation that serves all reads from an in-memory
+// buffer holding the entire contents of a metadata file.
+//
+// This wrapper is intended as a drop-in replacement for the file handle passed
+// to ReadablePBContainerFile when loading a log block container's metadata
+// file at startup: by slurping the whole file once and then satisfying every
+// subsequent ReadablePBContainerFile preadv() from memory, we eliminate the
+// per-record syscall.
+//
+// Encrypted metadata files are intentionally not handled here (see
+// MaybePreloadMetadataIntoMemory below), so this class assumes a plaintext
+// on-disk layout with no encryption header.
+//
+// The instance is immutable after construction and therefore trivially
+// thread-safe, matching RandomAccessFile's contract.
+class MemoryReadableFile : public RandomAccessFile {
+ public:
+  MemoryReadableFile(string filename, faststring data)
+      : filename_(std::move(filename)),
+        data_(std::move(data)) {}
+
+  Status Read(uint64_t offset, Slice result) const override {
+    // 'offset' and 'result.size()' are both bounded above by the on-disk
+    // file size, which we cap to the (uint64_t) replay threshold flag
+    // before constructing this object, so the addition below cannot overflow.
+    if (PREDICT_FALSE(offset + result.size() > data_.size())) {
+      return Status::IOError(
+          Substitute("out-of-bounds in-memory read in $0: "
+                     "offset=$1 size=$2 file_size=$3",
+                     filename_, offset, result.size(), data_.size()));
+    }
+    memcpy(result.mutable_data(), data_.data() + offset, result.size());
+    return Status::OK();
+  }
+
+  Status ReadV(uint64_t offset, ArrayView<Slice> results) const override {
+    for (const auto& s : results) {
+      RETURN_NOT_OK(Read(offset, s));
+      offset += s.size();
+    }
+    return Status::OK();
+  }
+
+  Status Size(uint64_t* size) const override {
+    *size = data_.size();
+    return Status::OK();
+  }
+
+  const string& filename() const override { return filename_; }
+
+  size_t memory_footprint() const override {
+    return sizeof(*this) + data_.capacity() + filename_.capacity();
+  }
+
+  size_t GetEncryptionHeaderSize() const override { return 0; }
+
+ private:
+  const string filename_;
+  const faststring data_;
+};
+
+// If the metadata file pointed to by 'raw_reader' is small enough (per
+// --log_container_metadata_inmem_replay_threshold_bytes), slurp it entirely
+// into memory and return a MemoryReadableFile wrapping it. Otherwise (or on
+// any I/O error during the preload) return 'raw_reader' unchanged so the
+// caller falls back to streaming reads.
+unique_ptr<RandomAccessFile> MaybePreloadMetadataIntoMemory(
+    const string& metadata_path,
+    unique_ptr<RandomAccessFile> raw_reader) {
+  const uint64_t threshold =
+      FLAGS_log_container_metadata_inmem_replay_threshold_bytes;
+  if (threshold == 0) {
+    return raw_reader;
+  }
+
+  // Cheap encrypted-file check first: this avoids a stat() syscall for
+  // encrypted clusters, which always fall back to streaming.
+  //
+  // The streaming path's ability to recover from an incomplete trailing
+  // record (e.g. when a metadata write was interrupted by a crash and the
+  // on-disk tail consists of file-hole zeros) depends on a per-slice
+  // optimization inside DoDecryptV that skips decryption of all-zero
+  // ciphertext slices, leaving them as zeros in plaintext. A bulk read of
+  // the whole payload as a single slice would defeat that optimization and
+  // turn the trailing hole into garbled plaintext, which the PB container
+  // parser would misclassify as corruption instead of an incomplete write.
+  // Until we have a way to preserve that per-slice semantic in the
+  // in-memory path, fall back to streaming whenever encryption is enabled.
+  // Non-encrypted clusters still benefit from the optimization.
+  //
+  // TODO(KUDU-3779): extend the in-memory replay path to support encrypted
+  // metadata files.
+  const size_t header_size = raw_reader->GetEncryptionHeaderSize();
+  if (header_size > 0) {
+    return raw_reader;
+  }
+
+  uint64_t file_size = 0;
+  Status s = raw_reader->Size(&file_size);
+  if (PREDICT_FALSE(!s.ok())) {
+    KLOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to stat metadata file " << metadata_path
+        << " for in-memory replay; falling back to streaming reads: "
+        << s.ToString();
+    return raw_reader;
+  }
+  if (file_size == 0) {
+    // Empty metadata file: there's nothing to preload, and the streaming
+    // path will detect EOF immediately.
+    return raw_reader;
+  }
+  if (file_size > threshold) {
+    return raw_reader;
+  }
+
+  faststring buf;
+  buf.resize(file_size);
+  s = raw_reader->Read(/*offset=*/0, Slice(buf.data(), file_size));
+  if (PREDICT_FALSE(!s.ok())) {
+    KLOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to preload metadata file " << metadata_path
+        << " (" << file_size << " bytes) for in-memory replay; "
+        << "falling back to streaming reads: " << s.ToString();
+    return raw_reader;
+  }
+  VLOG(1) << "Preloaded metadata file " << metadata_path
+          << " (" << file_size << " bytes) for in-memory replay";
+  return std::unique_ptr<RandomAccessFile>(new MemoryReadableFile(
+      metadata_path, std::move(buf)));
+}
+
+} // anonymous namespace
+
 Status LogBlockContainerNativeMeta::ProcessRecords(
     FsReport* report,
     LogBlockManager::UntrackedBlockMap* live_blocks,
@@ -1403,13 +1558,20 @@ Status LogBlockContainerNativeMeta::ProcessRecords(
     vector<LogBlockRefPtr>* dead_blocks,
     uint64_t* max_block_id,
     ProcessRecordType type) {
-  string metadata_path = metadata_file_->filename();
-  unique_ptr<RandomAccessFile> metadata_reader;
+  const string metadata_path = metadata_file_->filename();
+  unique_ptr<RandomAccessFile> raw_reader;
   RandomAccessFileOptions opts;
   opts.is_sensitive = true;
   RETURN_NOT_OK_HANDLE_ERROR(block_manager()->env()->NewRandomAccessFile(
-      opts, metadata_path, &metadata_reader));
-  ReadablePBContainerFile pb_reader(std::move(metadata_reader));
+      opts, metadata_path, &raw_reader));
+
+  // Attempt to preload the entire metadata file into memory so that the
+  // subsequent ReadablePBContainerFile reads (2 preadv()s/record) are all
+  // satisfied from memory. Falls back to streaming on any failure or when the
+  // file exceeds the configured threshold.
+  unique_ptr<RandomAccessFile> reader =
+      MaybePreloadMetadataIntoMemory(metadata_path, std::move(raw_reader));
+  ReadablePBContainerFile pb_reader(std::move(reader));
   RETURN_NOT_OK_HANDLE_ERROR(pb_reader.Open());
 
   uint64_t data_file_size = 0;
