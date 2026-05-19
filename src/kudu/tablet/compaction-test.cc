@@ -77,6 +77,7 @@
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
@@ -91,6 +92,8 @@ DEFINE_uint32(merge_benchmark_num_rowsets, 3,
 DEFINE_uint32(merge_benchmark_num_rows_per_rowset, 500000,
               "Number of rowsets as input to the merge");
 
+DECLARE_bool(rowset_compaction_rows_per_block_enable_validation);
+DECLARE_uint32(rowset_compaction_rows_per_block);
 DECLARE_string(block_manager);
 
 using kudu::consensus::OpId;
@@ -1489,6 +1492,40 @@ TEST_F(TestCompaction, TestCountLiveRowsOfDiskRowSetsCompact) {
   uint64_t count = 0;
   ASSERT_OK(result->CountLiveRows(&count));
   ASSERT_EQ((100 - 50 + 10) * 3, count);
+}
+
+TEST_F(TestCompaction, TestRowsPerBlockValidator) {
+  // Capture original values and restore them automatically on scope exit.
+  const uint32_t original_rows_per_block = FLAGS_rowset_compaction_rows_per_block;
+  const bool original_enable_validation =
+      FLAGS_rowset_compaction_rows_per_block_enable_validation;
+  SCOPED_CLEANUP({
+    google::SetCommandLineOption(
+        "rowset_compaction_rows_per_block_enable_validation",
+        original_enable_validation ? "true" : "false");
+    google::SetCommandLineOption(
+        "rowset_compaction_rows_per_block",
+        std::to_string(original_rows_per_block).c_str());
+  });
+
+  // Values below the minimum (1) must be rejected.
+  ASSERT_EQ("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "0"));
+
+  // Values above the maximum (100) must be rejected.
+  ASSERT_EQ("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "101"));
+
+  // Boundary values 1 and 100 must be accepted.
+  ASSERT_NE("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "1"));
+  ASSERT_NE("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "100"));
+
+  // A mid-range value must also be accepted.
+  ASSERT_NE("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "50"));
+
+  // With validation disabled, out-of-range values must be accepted.
+  ASSERT_NE("", google::SetCommandLineOption(
+      "rowset_compaction_rows_per_block_enable_validation", "false"));
+  ASSERT_NE("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "0"));
+  ASSERT_NE("", google::SetCommandLineOption("rowset_compaction_rows_per_block", "101"));
 }
 
 } // namespace tablet

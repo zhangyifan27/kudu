@@ -91,6 +91,32 @@ DEFINE_double(tablet_inject_kudu_2233, 0,
 TAG_FLAG(tablet_inject_kudu_2233, unsafe);
 TAG_FLAG(tablet_inject_kudu_2233, hidden);
 
+DEFINE_bool(rowset_compaction_rows_per_block_enable_validation, true,
+            "Whether to enable validation for --rowset_compaction_rows_per_block "
+            "flag. This is a test-only flag.");
+TAG_FLAG(rowset_compaction_rows_per_block_enable_validation, unsafe);
+TAG_FLAG(rowset_compaction_rows_per_block_enable_validation, hidden);
+
+DEFINE_uint32(rowset_compaction_rows_per_block, 100,
+             "Number of base rows per block during DiskRowSet merge compaction. "
+             "Higher values cause more delta-file blocks to be held in memory "
+             "simultaneously, increasing peak memory usage.");
+TAG_FLAG(rowset_compaction_rows_per_block, experimental);
+TAG_FLAG(rowset_compaction_rows_per_block, runtime);
+
+static bool ValidateRowsPerBlockForCompaction(const char* flagname, uint32_t value) {
+  if (!FLAGS_rowset_compaction_rows_per_block_enable_validation) {
+    return true;
+  }
+  if (value < 1 || value > 100) {
+    LOG(ERROR) << flagname << " value must be in the range 1-100. Received: " << value;
+    return false;
+  }
+  return true;
+}
+
+DEFINE_validator(rowset_compaction_rows_per_block, &ValidateRowsPerBlockForCompaction);
+
 namespace kudu {
 namespace tablet {
 
@@ -248,9 +274,10 @@ class DiskRowSetCompactionInput : public CompactionOrFlushInput {
         redo_delta_iter_(std::move(redo_delta_iter)),
         undo_delta_iter_(std::move(undo_delta_iter)),
         mem_(32 * 1024),
-        block_(&base_iter_->schema(), kRowsPerBlock, &mem_),
-        redo_mutation_block_(kRowsPerBlock, static_cast<Mutation*>(nullptr)),
-        undo_mutation_block_(kRowsPerBlock, static_cast<Mutation*>(nullptr)),
+        rows_per_block_(FLAGS_rowset_compaction_rows_per_block),
+        block_(&base_iter_->schema(), rows_per_block_, &mem_),
+        redo_mutation_block_(rows_per_block_, static_cast<Mutation*>(nullptr)),
+        undo_mutation_block_(rows_per_block_, static_cast<Mutation*>(nullptr)),
         mem_consumed_(0),
         parent_tracker_(parent_tracker),
         tracker_(tracker) {}
@@ -371,14 +398,16 @@ class DiskRowSetCompactionInput : public CompactionOrFlushInput {
 
   RowBlockMemory mem_;
 
+  // Snapshot of FLAGS_rowset_compaction_rows_per_block taken at construction
+  // time. Since the flag is tagged 'runtime' it can change concurrently; all
+  // three of the members below must agree on the same rows per block, so we
+  // capture it once here and use it for all three.
+  const uint32_t rows_per_block_;
+
   // The current block of data which has come from the input iterator
   RowBlock block_;
   vector<Mutation*> redo_mutation_block_;
   vector<Mutation*> undo_mutation_block_;
-
-  enum {
-    kRowsPerBlock = 100
-  };
 
   int64_t mem_consumed_;
   std::shared_ptr<MemTracker> parent_tracker_;
