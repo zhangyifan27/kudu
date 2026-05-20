@@ -297,6 +297,10 @@ class DiskRowSetCompactionInput : public CompactionOrFlushInput {
     RETURN_NOT_OK(redo_delta_iter_->SeekToOrdinal(0));
     RETURN_NOT_OK(undo_delta_iter_->Init(&spec));
     RETURN_NOT_OK(undo_delta_iter_->SeekToOrdinal(0));
+
+    // Pre-account for the arena's initial component so that the first
+    // PrepareBlock's Reset() produces a correctly-signed delta.
+    UpdateMemTracker(static_cast<int64_t>(block_.arena()->memory_footprint()));
     return Status::OK();
   }
 
@@ -322,7 +326,12 @@ class DiskRowSetCompactionInput : public CompactionOrFlushInput {
   }
 
   Status PrepareBlock(vector<CompactionInputRow>* block) override {
+    // Track arena growth from materializing the base row data.
+    size_t arena_before_base = block_.arena()->memory_footprint();
     RETURN_NOT_OK(base_iter_->NextBlock(&block_));
+    UpdateMemTracker(static_cast<int64_t>(block_.arena()->memory_footprint()) -
+                     static_cast<int64_t>(arena_before_base));
+
     std::fill(redo_mutation_block_.begin(), redo_mutation_block_.end(),
               static_cast<Mutation*>(nullptr));
     std::fill(undo_mutation_block_.begin(), undo_mutation_block_.end(),

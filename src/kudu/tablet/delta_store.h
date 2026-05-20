@@ -482,13 +482,12 @@ class DeltaPreparer : public PreparedDeltas {
   }
 
   int64_t delta_blocks_mem_size() const {
-    int64_t delta_blocks_size_total = prepared_deltas_.size() * sizeof(PreparedDelta);
-
-    for (const auto& delta : prepared_deltas_) {
-      delta_blocks_size_total += delta.val.size();
-    }
-
-    return delta_blocks_size_total;
+    // Each PreparedDelta is a struct (DeltaKey + Slice) stored in the
+    // prepared_deltas_ deque. The Slice::val field is a zero-copy view
+    // into a CFile block buffer that is already accounted for by
+    // DeltaFileIterator::delta_blocks_mem_size_. Adding val.size() here
+    // would double-count those bytes, so only count the struct overhead.
+    return static_cast<int64_t>(prepared_deltas_.size()) * sizeof(PreparedDelta);
   }
 
   void set_deltas_selected(int64_t deltas_selected) {

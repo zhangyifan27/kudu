@@ -2223,9 +2223,6 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompactionOrFlush &input,
                           "PostSwapInDuplicatingRowSet hook failed");
   }
 
-  // Store the stats on the max memory used for compaction phase 1.
-  const size_t peak_mem_usage_ph1 = merge->memory_footprint();
-
   // Phase 2. Here we re-scan the compaction input, copying those missed updates into the
   // new rowset's DeltaTracker.
   VLOG_WITH_PREFIX(1) << Substitute("$0: Phase 2: carrying over any updates "
@@ -2288,8 +2285,13 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompactionOrFlush &input,
   AtomicSwapRowSets({ inprogress_rowset }, new_disk_rowsets);
   UpdateAverageRowsetHeight();
 
-  const size_t peak_mem_usage = std::max(peak_mem_usage_ph1,
-                                         merge->memory_footprint());
+  // Use the tracker's high-water mark as the authoritative peak memory figure.
+  // MergeCompactionInput::max_memory_usage_ (returned by merge->memory_footprint()) is
+  // sampled only at FinishBlock() time, after ProcessEmptyInputs() has already removed
+  // exhausted states so it consistently misses the true peak (when all DRS delta
+  // blocks are simultaneously resident after Init()). It also leaves out base-data arena
+  // and ApplyMutations arena contributions that the tracker does capture.
+  const size_t peak_mem_usage = static_cast<size_t>(tracker->peak_consumption());
   // For rowset merge compactions, update the stats on the max peak memory used
   // and ratio of the amount of memory used to the size of all deltas on disk.
   if (deltas_on_disk_size > 0) {

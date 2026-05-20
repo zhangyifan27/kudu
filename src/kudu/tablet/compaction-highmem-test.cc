@@ -251,10 +251,16 @@ TEST_F(TestHighMemCompaction, TestRowSetCompactionSkipWithBudgetingConstraints) 
 TEST_F(TestHighMemCompaction, TestMajorCompactionMemoryPressure) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
-  // Approximate memory consumed by delta compaction during the course of this test.
-  // Total consumption would always exceed this usage. Since we want to be
-  // certain that warning threshold limit is crossed, this value is kept low.
-  constexpr int64_t compaction_mem_usage_approx = 3 * 1024 * 1024;
+  // Set the threshold to a value that is reliably below the minimum tracked
+  // allocation during any compaction run — concretely below the initial 32 KB
+  // arena footprint reported to the tracker at the start of FlushRowSetAndDeltas().
+  // In ASAN builds CurrentConsumption() falls back to
+  // MemTracker::GetRootTracker()->consumption() instead of tcmalloc heap
+  // usage. After fixing the double-counting in delta_blocks_mem_size(), the
+  // tracker value is lower and the old 3 MB constant was no longer reliably
+  // exceeded. Using 16 KB as the threshold guarantees the warning fires for
+  // compaction on both ASAN and non-ASAN builds.
+  constexpr int64_t compaction_mem_usage_approx = 16 * 1024;
 
   // Set appropriate flags to ensure memory threshold checks fail.
   FLAGS_memory_limit_compact_usage_warn_threshold_percentage =
@@ -266,10 +272,10 @@ TEST_F(TestHighMemCompaction, TestMajorCompactionMemoryPressure) {
 TEST_F(TestHighMemCompaction, TestRowSetCompactionMemoryPressure) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
-  // Approximate memory consumed by rowset compaction during the course of this test.
-  // Total consumption would always exceed this usage. Since we want to be
-  // certain that warning threshold limit is crossed, this value is kept low.
-  constexpr int64_t compaction_mem_usage_approx = 3 * 1024 * 1024;
+  // Same rationale as TestMajorCompactionMemoryPressure: use 16 KB so the
+  // warning threshold is reliably crossed on both ASAN and non-ASAN builds
+  // after fixing the double-counting in delta_blocks_mem_size().
+  constexpr int64_t compaction_mem_usage_approx = 16 * 1024;
 
   // Set appropriate flags to ensure memory threshold checks fail.
   FLAGS_memory_limit_compact_usage_warn_threshold_percentage =

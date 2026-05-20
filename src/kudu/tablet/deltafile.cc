@@ -675,8 +675,6 @@ Status DeltaFileIterator<Type>::AddDeltas(rowid_t start_row, rowid_t stop_row) {
       }
     }
   }
-  delta_blocks_mem_size_ += preparer_.delta_blocks_mem_size();
-
   return Status::OK();
 }
 

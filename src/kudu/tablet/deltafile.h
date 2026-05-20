@@ -288,7 +288,14 @@ class DeltaFileIterator : public DeltaIterator {
   }
 
   size_t memory_footprint() override {
-    return delta_blocks_mem_size_;
+    // delta_blocks_mem_size_ tracks the uncompressed bytes of every CFile
+    // block buffer currently held in delta_blocks_ (ReadBlock decompresses
+    // the buffer on read and stores the uncompressed buffer in the BlockHandle).
+    // preparer_.delta_blocks_mem_size() counts only the sizeof(PreparedDelta)
+    // struct overhead for entries in prepared_deltas_; each PreparedDelta::val
+    // is a zero-copy Slice into one of those block buffers, so its payload
+    // bytes must not be re-added here.
+    return delta_blocks_mem_size_ + preparer_.delta_blocks_mem_size();
   }
 
  private:
