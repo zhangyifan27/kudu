@@ -323,11 +323,11 @@ void OutboundCall::CallCallback() {
   }
 }
 
-void OutboundCall::SetResponse(unique_ptr<CallResponse> resp) {
+void OutboundCall::SetResponse(CallResponse&& resp) {
   call_response_ = std::move(resp);
-  Slice r(call_response_->serialized_response());
+  Slice r(call_response_.serialized_response());
 
-  if (call_response_->is_success()) {
+  if (call_response_.is_success()) {
     // TODO: here we're deserializing the call response within the reactor thread,
     // which isn't great, since it would block processing of other RPCs in parallel.
     // Should look into a way to avoid this.
@@ -532,10 +532,6 @@ void OutboundCall::DumpPB(const DumpConnectionsRequestPB& req,
 /// CallResponse
 ///
 
-CallResponse::CallResponse()
- : parsed_(false) {
-}
-
 Status CallResponse::GetSidecar(int idx, Slice* sidecar) const {
   DCHECK(parsed_);
   if (PREDICT_FALSE(idx < 0 || idx >= header_.sidecar_offsets_size())) {
@@ -547,7 +543,7 @@ Status CallResponse::GetSidecar(int idx, Slice* sidecar) const {
 }
 
 Status CallResponse::ParseFrom(unique_ptr<InboundTransfer> transfer) {
-  CHECK(!parsed_);
+  DCHECK(!parsed_);
   RETURN_NOT_OK(serialization::ParseMessage(transfer->data(), &header_,
                                             &serialized_response_));
 

@@ -105,11 +105,11 @@ const ErrorStatusPB* RpcController::error_response() const {
 }
 
 int32_t RpcController::call_id() const {
-  return call_->call_response_->call_id();
+  return call_->call_response_.call_id();
 }
 
 Status RpcController::GetInboundSidecar(int idx, Slice* sidecar) const {
-  return call_->call_response_->GetSidecar(idx, sidecar);
+  return call_->call_response_.GetSidecar(idx, sidecar);
 }
 
 void RpcController::set_timeout(const MonoDelta& timeout) {

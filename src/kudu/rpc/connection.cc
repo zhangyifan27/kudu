@@ -637,15 +637,15 @@ void Connection::HandleIncomingCall(unique_ptr<InboundTransfer> transfer) {
 
 void Connection::HandleCallResponse(unique_ptr<InboundTransfer> transfer) {
   DCHECK(reactor_thread_->IsCurrentThread());
-  unique_ptr<CallResponse> resp(new CallResponse);
-  CHECK_OK(resp->ParseFrom(std::move(transfer)));
+  CallResponse resp;
+  CHECK_OK(resp.ParseFrom(std::move(transfer)));
 
   CallAwaitingResponse* car_ptr = EraseKeyReturnValuePtr(
-      &awaiting_response_, resp->call_id());
+      &awaiting_response_, resp.call_id());
   if (PREDICT_FALSE(car_ptr == nullptr)) {
     LOG(WARNING) << Substitute(
         "$0: got a response for call id $1 which was not pending, ignoring",
-        ToString(), resp->call_id());
+        ToString(), resp.call_id());
     return;
   }
 
@@ -656,7 +656,7 @@ void Connection::HandleCallResponse(unique_ptr<InboundTransfer> transfer) {
     // The call already failed due to a timeout.
     VLOG(1) << Substitute(
         "got response to call id $0 after client already timed out or cancelled",
-         resp->call_id());
+         resp.call_id());
     return;
   }
 
