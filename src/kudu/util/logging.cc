@@ -146,19 +146,6 @@ SimpleSink* registered_sink = nullptr;
 // Protected by 'logging_mutex'.
 int initial_stderr_severity;
 
-void EnableAsyncLogging() {
-  debug::ScopedLeakCheckDisabler leaky;
-
-  // Enable Async for every level except for FATAL. Fatal should be synchronous
-  // to ensure that we get the fatal log message written before exiting.
-  for (auto level : { google::INFO, google::WARNING, google::ERROR }) {
-    auto* orig = google::base::GetLogger(level);
-    auto* async = new AsyncLogger(orig, FLAGS_log_async_buffer_bytes_per_level);
-    async->Start();
-    google::base::SetLogger(level, async);
-  }
-}
-
 void UnregisterLoggingCallbackUnlocked() {
   CHECK(logging_mutex.IsHeld());
   CHECK(registered_sink);
@@ -170,6 +157,16 @@ void UnregisterLoggingCallbackUnlocked() {
   delete registered_sink;
   registered_sink = nullptr;
 }
+} // anonymous namespace
+
+// The Kudu client library doesn't invoke InitGoogleLoggingSafe(...) function,
+// but the function invokes BlockSigUSR1() which is defined in minidump-related
+// code, which in its turn requires compiling breakpad from the 3rd-party.
+// So, by excluding InitGoogleLoggingSafe(...), it's possible to get rid of
+// breakpad dependency and save CPU cycles while exclusively compiling
+// the Kudu client library.
+#if !defined(KUDU_CLIENT_ONLY)
+namespace {
 
 void FlushCoverageOnExit() {
   // Coverage flushing is not re-entrant, but this might be called from a
@@ -205,6 +202,19 @@ void FailureWriterWithCoverage(const char* data, size_t size) {
   }
 }
 
+void EnableAsyncLogging() {
+  debug::ScopedLeakCheckDisabler leaky;
+
+  // Enable Async for every level except for FATAL. Fatal should be synchronous
+  // to ensure that we get the fatal log message written before exiting.
+  for (auto level : { google::INFO, google::WARNING, google::ERROR }) {
+    auto* orig = google::base::GetLogger(level);
+    auto* async = new AsyncLogger(orig, FLAGS_log_async_buffer_bytes_per_level);
+    async->Start();
+    google::base::SetLogger(level, async);
+  }
+}
+
 // GLog "failure function". This is called in the case of LOG(FATAL) to
 // ensure that we flush coverage even on crashes.
 //
@@ -213,6 +223,7 @@ void FlushCoverageAndAbort() {
   FlushCoverageOnExit();
   exit(1);
 }
+
 } // anonymous namespace
 
 void InitGoogleLoggingSafe(const char* arg) {
@@ -294,6 +305,7 @@ void InitGoogleLoggingSafe(const char* arg) {
 
   logging_initialized = true;
 }
+#endif // #if !defined(KUDU_CLIENT_ONLY) ...
 
 void InitGoogleLoggingSafeBasic(const char* arg) {
   SpinLockHolder l(&logging_mutex);

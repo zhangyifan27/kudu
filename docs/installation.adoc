@@ -721,6 +721,38 @@ make -j4
 ----
 ====
 
+[[build_cpp_client_only]]
+== Building only Kudu {cpp} Client Library and its dependencies
+For a use case where it's not necessary to build Kudu's server-side, but
+only Kudu {cpp} client library, it's possible to save time and computing
+resources by building a subset of third-party dependencies that are necessary
+for building kudu_client library only.
+
+. Build a subset of the third-party components that are necessary to build
+Kudu {cpp} client library by specifying `client_only` command-line
+argument for the `build-if-necessary.sh` script:
++
+[source,bash]
+----
+$ build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh client_only
+----
+
+. Build Kudu client library. Choose a build directory for the intermediate
+output, which can be anywhere in your filesystem except for the `kudu`
+directory itself. Run `make`, explicitly specifying `kudu_client` and
+`kudu_client_exported` targets.
++
+[source,bash]
+----
+mkdir -p build/release
+cd build/release
+../../thirdparty/installed/common/bin/cmake \
+  -DCMAKE_BUILD_TYPE=release \
+  -DKUDU_CLIENT_ONLY=1 \
+  ../..
+make -j4 kudu_client kudu_client_exported
+----
+
 [[build_cpp_client]]
 == Installing the {cpp} Client Libraries
 

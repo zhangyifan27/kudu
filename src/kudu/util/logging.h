@@ -257,12 +257,15 @@ namespace kudu {
 
 class Env;
 
+// The Kudu client library doesn't invoke InitGoogleLoggingSafe(...) function.
+#if !defined(KUDU_CLIENT_ONLY)
 // glog doesn't allow multiple invocations of InitGoogleLogging. This method conditionally
 // calls InitGoogleLogging only if it hasn't been called before.
 //
 // It also takes care of installing the google failure signal handler and
 // setting the signal handler for SIGPIPE to SIG_IGN.
 void InitGoogleLoggingSafe(const char* arg);
+#endif // #if !defined(KUDU_CLIENT_ONLY) ...
 
 // Like InitGoogleLoggingSafe() but stripped down: no signal handlers are
 // installed, regular logging is disabled, and log events of any severity

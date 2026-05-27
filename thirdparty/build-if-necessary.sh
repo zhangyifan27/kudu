@@ -31,6 +31,9 @@ case $1 in
   "")
     DEPENDENCY_GROUPS="common uninstrumented"
     ;;
+  "client_only")
+    DEPENDENCY_GROUPS="client_only"
+    ;;
   "tsan")
     DEPENDENCY_GROUPS="common tsan"
     ;;

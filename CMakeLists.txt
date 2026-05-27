@@ -48,6 +48,28 @@ if("${CMAKE_CURRENT_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_BINARY_DIR}" AND
     "directory, otherwise future builds will not work.")
 endif()
 
+option(KUDU_CLIENT_ONLY "Configure for building only kudu_client/kudu_client_exported targets" OFF)
+if(KUDU_CLIENT_ONLY)
+  # The option of building client-only components isn't available in
+  # ASAN/TSAN/UBSAN configurations since LLVM/CLANG isn't one of the 3rd-party
+  # components built for the 'client_only' dependency group.
+  if (KUDU_USE_TSAN OR KUDU_USE_ASAN OR KUDU_USE_UBSAN)
+    message(FATAL_ERROR
+      "Client-only build is available only in RELEASE/DEBUG configurations")
+  endif()
+
+  # KUDU_CLIENT_ONLY implies NO_TESTS.
+  set(NO_TESTS TRUE)
+  message(STATUS "Setting NO_TESTS since using KUDU_CLIENT_ONLY")
+
+  # KUDU_CLIENT_ONLY implies NO_CHRONY.
+  set(NO_CHRONY TRUE)
+  message(STATUS "Setting NO_CHRONY since using KUDU_CLIENT_ONLY")
+
+  # Add a flag for the pre-processor.
+  add_definitions(-DKUDU_CLIENT_ONLY)
+endif()
+
 # Provide a 'latest' symlink to this build directory if the "blessed"
 # multi-build layout is detected:
 #
@@ -101,60 +123,62 @@ set(THIRDPARTY_INSTALL_COMMON_DIR ${THIRDPARTY_INSTALL_DIR}/common)
 set(THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR ${THIRDPARTY_INSTALL_DIR}/uninstrumented)
 set(THIRDPARTY_INSTALL_TSAN_DIR ${THIRDPARTY_INSTALL_DIR}/tsan)
 
-# Set the Java directory so our C++ tests are able to access its contents.
-# This can be useful to, e.g. spawn a Java subprocess.
-set(JAVA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/java)
+if(NOT KUDU_CLIENT_ONLY)
+  # Set the Java directory so our C++ tests are able to access its contents.
+  # This can be useful to, e.g. spawn a Java subprocess.
+  set(JAVA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/java)
 
-# Adds the EXTRA_GRADLE_FLAGS environment variable to a cmake list and calls `separate_arguments`.
-# This solves the problem of escaped spaces in the EXTRA_GRADLE_FLAGS environment variable.
-list(APPEND GRADLE_FLAGS $ENV{EXTRA_GRADLE_FLAGS})
-separate_arguments(GRADLE_FLAGS)
-# When invoking Gradle:
-#   * Log errors only, reducing the verbosity of the Gradle's output
-#   * Make the output better fit for plain consoles, avoiding garbled logs
-list(APPEND GRADLE_FLAGS --quiet --console=plain)
-list(REMOVE_DUPLICATES GRADLE_FLAGS)
+  # Adds the EXTRA_GRADLE_FLAGS environment variable to a cmake list and calls `separate_arguments`.
+  # This solves the problem of escaped spaces in the EXTRA_GRADLE_FLAGS environment variable.
+  list(APPEND GRADLE_FLAGS $ENV{EXTRA_GRADLE_FLAGS})
+  separate_arguments(GRADLE_FLAGS)
+  # When invoking Gradle:
+  #   * Log errors only, reducing the verbosity of the Gradle's output
+  #   * Make the output better fit for plain consoles, avoiding garbled logs
+  list(APPEND GRADLE_FLAGS --quiet --console=plain)
+  list(REMOVE_DUPLICATES GRADLE_FLAGS)
 
-# Initialize Gradle to ensure the wrapper is downloaded.
-# This is important so that multiple calls to Gradle don't try and
-# download the gradle-wrapper.jar at the same time.
-set(GRADLE_WRAPPER_JAR ${JAVA_DIR}/gradle/wrapper/gradle-wrapper.jar)
-add_custom_command(OUTPUT ${GRADLE_WRAPPER_JAR}
-  COMMAND ./gradlew --version ${GRADLE_FLAGS}
-  COMMAND ./gradlew initializeTasks ${GRADLE_FLAGS}
-  WORKING_DIRECTORY "${JAVA_DIR}")
-add_custom_target(init_gradle DEPENDS ${GRADLE_WRAPPER_JAR})
+  # Initialize Gradle to ensure the wrapper is downloaded.
+  # This is important so that multiple calls to Gradle don't try and
+  # download the gradle-wrapper.jar at the same time.
+  set(GRADLE_WRAPPER_JAR ${JAVA_DIR}/gradle/wrapper/gradle-wrapper.jar)
+  add_custom_command(OUTPUT ${GRADLE_WRAPPER_JAR}
+    COMMAND ./gradlew --version ${GRADLE_FLAGS}
+    COMMAND ./gradlew initializeTasks ${GRADLE_FLAGS}
+    WORKING_DIRECTORY "${JAVA_DIR}")
+  add_custom_target(init_gradle DEPENDS ${GRADLE_WRAPPER_JAR})
 
-# A target to build the kudu-proto Java module which is used
-# by the kudu-subprocess and kudu-hive modules to avoid building
-# multiple times and potential race conditions in Gradle code
-# generation.
-set(PROTO_JAR ${JAVA_DIR}/kudu-proto/build/libs/kudu-proto-${KUDU_VERSION_NUMBER}.jar)
-add_custom_command(OUTPUT ${PROTO_JAR}
-        COMMAND ./gradlew :kudu-proto:jar ${GRADLE_FLAGS}
-        WORKING_DIRECTORY "${JAVA_DIR}"
-        DEPENDS init_gradle)
-add_custom_target(proto_jar DEPENDS ${PROTO_JAR})
+  # A target to build the kudu-proto Java module which is used
+  # by the kudu-subprocess and kudu-hive modules to avoid building
+  # multiple times and potential race conditions in Gradle code
+  # generation.
+  set(PROTO_JAR ${JAVA_DIR}/kudu-proto/build/libs/kudu-proto-${KUDU_VERSION_NUMBER}.jar)
+  add_custom_command(OUTPUT ${PROTO_JAR}
+          COMMAND ./gradlew :kudu-proto:jar ${GRADLE_FLAGS}
+          WORKING_DIRECTORY "${JAVA_DIR}"
+          DEPENDS init_gradle)
+  add_custom_target(proto_jar DEPENDS ${PROTO_JAR})
 
-# An artificial target for sequencing of building the subprocess_jar and the
-# hms_plugin_jar targets. The sequencing is to work around the following issues
-# when running multiple gradle instances in parallel, concurrently building
-# the targets:
-#
-#   * Sometimes it ends up with java.lang.ArrayIndexOutOfBoundsException
-#     while building shadowJar for corresponding Java dependencies,
-#     and while it's not yet clear whether the issue is in shadowJar
-#     implementation or elsewhere, it's quite simple to address the issue
-#     by not running multiple Gradle instances concurrently
-#
-#   * Sometimes the following error is reported, as seen elsewhere [1][2]:
-#
-#       Timeout waiting to lock Java compile cache (...). It is currently in use by another Gradle instance.
-#
-# [1] https://github.com/gradle/gradle/issues/8375
-# [2] https://github.com/gradle/gradle/issues/11861
-#
-add_custom_target(subprocess_jar_seq DEPENDS subprocess_jar)
+  # An artificial target for sequencing of building the subprocess_jar and the
+  # hms_plugin_jar targets. The sequencing is to work around the following issues
+  # when running multiple gradle instances in parallel, concurrently building
+  # the targets:
+  #
+  #   * Sometimes it ends up with java.lang.ArrayIndexOutOfBoundsException
+  #     while building shadowJar for corresponding Java dependencies,
+  #     and while it's not yet clear whether the issue is in shadowJar
+  #     implementation or elsewhere, it's quite simple to address the issue
+  #     by not running multiple Gradle instances concurrently
+  #
+  #   * Sometimes the following error is reported, as seen elsewhere [1][2]:
+  #
+  #       Timeout waiting to lock Java compile cache (...). It is currently in use by another Gradle instance.
+  #
+  # [1] https://github.com/gradle/gradle/issues/8375
+  # [2] https://github.com/gradle/gradle/issues/11861
+  #
+  add_custom_target(subprocess_jar_seq DEPENDS subprocess_jar)
+endif()
 
 # Allow "make install" to not depend on all targets.
 #
@@ -176,8 +200,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 
 # Make sure thirdparty stuff is up-to-date.
 if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
+  # KUDU_USE_TSAN and KUDU_CLIENT_ONLY are mutually exclusive.
   if (${KUDU_USE_TSAN})
     set(TP_ARGS "tsan")
+  elseif (KUDU_CLIENT_ONLY)
+    set(TP_ARGS "client_only")
   endif()
   execute_process(
     COMMAND ${THIRDPARTY_DIR}/build-if-necessary.sh ${TP_ARGS}
@@ -1106,26 +1133,32 @@ ADD_THIRDPARTY_LIB(protoc
   DEPS protobuf)
 find_package(KRPC REQUIRED)
 
-## Thrift
-find_package(Thrift REQUIRED)
-include_directories(SYSTEM ${THRIFT_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(thrift
-  STATIC_LIB "${THRIFT_STATIC_LIBRARY}"
-  SHARED_LIB "${THRIFT_SHARED_LIBRARY}")
+## Apache Thrift
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Thrift REQUIRED)
+  include_directories(SYSTEM ${THRIFT_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(thrift
+    STATIC_LIB "${THRIFT_STATIC_LIBRARY}"
+    SHARED_LIB "${THRIFT_SHARED_LIBRARY}")
+endif()
 
-# The mini-HMS relies on JAVA_HOME being set in order to run the HMS, and
-# JDK 1.7 or later for compiling the Kudu metastore plugin.
-find_package(JavaHome REQUIRED)
-find_package(Java 1.7 REQUIRED)
-# Defines the add_jar() CMake command.
-include(UseJava)
+if (NOT KUDU_CLIENT_ONLY)
+  # The mini-HMS relies on JAVA_HOME being set in order to run the HMS, and
+  # JDK 1.7 or later for compiling the Kudu metastore plugin.
+  find_package(JavaHome REQUIRED)
+  find_package(Java 1.7 REQUIRED)
+  # Defines the add_jar() CMake command.
+  include(UseJava)
+endif()
 
 ## Snappy
-find_package(Snappy REQUIRED)
-include_directories(SYSTEM ${SNAPPY_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(snappy
-  STATIC_LIB "${SNAPPY_STATIC_LIB}"
-  SHARED_LIB "${SNAPPY_SHARED_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Snappy REQUIRED)
+  include_directories(SYSTEM ${SNAPPY_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(snappy
+    STATIC_LIB "${SNAPPY_STATIC_LIB}"
+    SHARED_LIB "${SNAPPY_SHARED_LIB}")
+endif()
 
 ## Libev
 find_package(LibEv REQUIRED)
@@ -1135,14 +1168,18 @@ ADD_THIRDPARTY_LIB(libev
   SHARED_LIB "${LIBEV_SHARED_LIB}")
 
 ## LZ4
-find_package(Lz4 REQUIRED)
-include_directories(SYSTEM ${LZ4_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(lz4 STATIC_LIB "${LZ4_STATIC_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Lz4 REQUIRED)
+  include_directories(SYSTEM ${LZ4_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(lz4 STATIC_LIB "${LZ4_STATIC_LIB}")
+endif()
 
 ## Bitshuffle
-find_package(Bitshuffle REQUIRED)
-include_directories(SYSTEM ${BITSHUFFLE_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(bitshuffle STATIC_LIB "${BITSHUFFLE_STATIC_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Bitshuffle REQUIRED)
+  include_directories(SYSTEM ${BITSHUFFLE_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(bitshuffle STATIC_LIB "${BITSHUFFLE_STATIC_LIB}")
+endif()
 
 ## ZLib
 find_package(Zlib REQUIRED)
@@ -1152,20 +1189,26 @@ ADD_THIRDPARTY_LIB(zlib
   SHARED_LIB "${ZLIB_SHARED_LIB}")
 
 ## Squeasel
-find_package(Squeasel REQUIRED)
-include_directories(SYSTEM ${SQUEASEL_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(squeasel
-  STATIC_LIB "${SQUEASEL_STATIC_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Squeasel REQUIRED)
+  include_directories(SYSTEM ${SQUEASEL_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(squeasel
+    STATIC_LIB "${SQUEASEL_STATIC_LIB}")
+endif()
 
 ## Mustache
-find_package(Mustache REQUIRED)
-include_directories(SYSTEM ${MUSTACHE_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(mustache
-  STATIC_LIB "${MUSTACHE_STATIC_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Mustache REQUIRED)
+  include_directories(SYSTEM ${MUSTACHE_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(mustache
+    STATIC_LIB "${MUSTACHE_STATIC_LIB}")
+endif()
 
 ## jwt-cpp
-find_package(JwtCpp REQUIRED)
-include_directories(${JWT_CPP_INCLUDE_DIR})
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(JwtCpp REQUIRED)
+  include_directories(${JWT_CPP_INCLUDE_DIR})
+endif()
 
 ## OpenSSL
 ##
@@ -1222,12 +1265,14 @@ if (NOT "${KUDU_USE_ASAN}" AND
 endif()
 
 ## curl
-find_package(CURL REQUIRED)
-include_directories(SYSTEM ${CURL_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(curl
-  STATIC_LIB "${CURL_STATIC_LIB}"
-  SHARED_LIB "${CURL_SHARED_LIB}"
-  DEPS zlib)
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(CURL REQUIRED)
+  include_directories(SYSTEM ${CURL_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(curl
+    STATIC_LIB "${CURL_STATIC_LIB}"
+    SHARED_LIB "${CURL_SHARED_LIB}"
+    DEPS zlib)
+endif()
 
 ## crcutil
 find_package(Crcutil REQUIRED)
@@ -1237,7 +1282,7 @@ ADD_THIRDPARTY_LIB(crcutil
   SHARED_LIB "${CRCUTIL_SHARED_LIB}")
 
 ## breakpad
-if (NOT APPLE)
+if (NOT APPLE AND NOT KUDU_CLIENT_ONLY)
   find_package(BreakpadClient REQUIRED)
   include_directories(SYSTEM ${BREAKPAD_CLIENT_INCLUDE_DIR})
   ADD_THIRDPARTY_LIB(breakpad_client
@@ -1248,12 +1293,14 @@ endif()
 ## llvm
 # Note that llvm has a unique cmake setup. See kudu/codegen/CMakeLists.txt
 # for details.
-find_package(LLVM REQUIRED CONFIG)
-if(${LLVM_PACKAGE_VERSION} VERSION_LESS 3.4)
-  message(FATAL_ERROR "LLVM version (${LLVM_PACKAGE_VERSION}) must be at least 3.4")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(LLVM REQUIRED CONFIG)
+  if(${LLVM_PACKAGE_VERSION} VERSION_LESS 3.4)
+    message(FATAL_ERROR "LLVM version (${LLVM_PACKAGE_VERSION}) must be at least 3.4")
+  endif()
+  message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+  message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 endif()
-message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 ## librt
 if (NOT APPLE)
@@ -1294,26 +1341,32 @@ else()
 endif()
 
 ## yaml
-find_package(Yaml REQUIRED)
-include_directories(SYSTEM ${YAML_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(yaml
-  STATIC_LIB "${YAML_STATIC_LIB}"
-  SHARED_LIB "${YAML_SHARED_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(Yaml REQUIRED)
+  include_directories(SYSTEM ${YAML_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(yaml
+    STATIC_LIB "${YAML_STATIC_LIB}"
+    SHARED_LIB "${YAML_SHARED_LIB}")
+endif()
 
 ## gumbo-parser
-find_package(GumboParser REQUIRED)
-include_directories(SYSTEM ${GUMBO_PARSER_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(gumbo-parser
-  STATIC_LIB "${GUMBO_PARSER_STATIC_LIB}"
-  SHARED_LIB "${GUMBO_PARSER_SHARED_LIB}")
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(GumboParser REQUIRED)
+  include_directories(SYSTEM ${GUMBO_PARSER_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(gumbo-parser
+    STATIC_LIB "${GUMBO_PARSER_STATIC_LIB}"
+    SHARED_LIB "${GUMBO_PARSER_SHARED_LIB}")
+endif()
 
 ## gumbo-query
-find_package(GumboQuery REQUIRED)
-include_directories(SYSTEM ${GUMBO_QUERY_INCLUDE_DIR})
-ADD_THIRDPARTY_LIB(gumbo-query
-  STATIC_LIB "${GUMBO_QUERY_STATIC_LIB}"
-  SHARED_LIB "${GUMBO_QUERY_SHARED_LIB}"
-  DEPS gumbo-parser)
+if (NOT KUDU_CLIENT_ONLY)
+  find_package(GumboQuery REQUIRED)
+  include_directories(SYSTEM ${GUMBO_QUERY_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(gumbo-query
+    STATIC_LIB "${GUMBO_QUERY_STATIC_LIB}"
+    SHARED_LIB "${GUMBO_QUERY_SHARED_LIB}"
+    DEPS gumbo-parser)
+endif()
 
 ## Boost
 
@@ -1328,7 +1381,7 @@ ADD_THIRDPARTY_LIB(boost_date_time
 
 ## rocksdb
 # The 'logr' block manager will be built if not disabled explicitly.
-if("${NO_ROCKSDB}" STREQUAL "" OR NOT NO_ROCKSDB)
+if(("${NO_ROCKSDB}" STREQUAL "" OR NOT NO_ROCKSDB) AND NOT KUDU_CLIENT_ONLY)
   set(NO_ROCKSDB 0)
   find_package(Rocksdb REQUIRED)
   include_directories(SYSTEM ${ROCKSDB_INCLUDE_DIR})
@@ -1486,8 +1539,11 @@ endif (UNIX)
 # "generated-headers" target
 ############################################################
 if (UNIX)
-  add_custom_target(generated-headers
-    DEPENDS pb-gen krpc-gen fb-gen hms_thrift gen_version_info)
+  set(GENERATED_HEADERS_DEPS pb-gen krpc-gen fb-gen gen_version_info)
+  if (NOT KUDU_CLIENT_ONLY)
+    set(GENERATED_HEADERS_DEPS ${GENERATED_HEADERS_DEPS} hms_thrift)
+  endif()
+  add_custom_target(generated-headers DEPENDS ${GENERATED_HEADERS_DEPS})
 endif (UNIX)
 
 ############################################################
@@ -1587,21 +1643,27 @@ add_subdirectory(src/kudu/benchmarks)
 add_subdirectory(src/kudu/cfile)
 add_subdirectory(src/kudu/client)
 add_subdirectory(src/kudu/clock)
-add_subdirectory(src/kudu/codegen)
+if(NOT KUDU_CLIENT_ONLY)
+  add_subdirectory(src/kudu/codegen)
+endif()
 add_subdirectory(src/kudu/common)
 add_subdirectory(src/kudu/consensus)
 add_subdirectory(src/kudu/experiments)
 add_subdirectory(src/kudu/fs)
 # Google util libraries borrowed from supersonic, tcmalloc, Chromium, etc.
 add_subdirectory(src/kudu/gutil)
-add_subdirectory(src/kudu/hms)
+if(NOT KUDU_CLIENT_ONLY)
+  add_subdirectory(src/kudu/hms)
+endif()
 add_subdirectory(src/kudu/integration-tests)
 add_subdirectory(src/kudu/kserver)
 add_subdirectory(src/kudu/master)
 add_subdirectory(src/kudu/mini-cluster)
-add_subdirectory(src/kudu/postgres)
-add_subdirectory(src/kudu/ranger)
-add_subdirectory(src/kudu/ranger-kms)
+if(NOT KUDU_CLIENT_ONLY)
+  add_subdirectory(src/kudu/postgres)
+  add_subdirectory(src/kudu/ranger)
+  add_subdirectory(src/kudu/ranger-kms)
+endif()
 add_subdirectory(src/kudu/rebalance)
 add_subdirectory(src/kudu/rpc)
 add_subdirectory(src/kudu/security)

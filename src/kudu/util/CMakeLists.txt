@@ -172,17 +172,14 @@ else ()
 endif()
 
 set(UTIL_SRCS
-  async_logger.cc
   atomic.cc
   bitmap.cc
-  block_cache_metrics.cc
   block_bloom_filter.cc
   bloom_filter.cc
   cache.cc
   char_util.cc
   coding.cc
   condition_variable.cc
-  cow_object.cc
   crc.cc
   debug-util.cc
   decimal_util.cc
@@ -195,23 +192,17 @@ set(UTIL_SRCS
   errno.cc
   faststring.cc
   fault_injection.cc
-  file_cache.cc
-  file_cache_metrics.cc
   flags.cc
   flag_tags.cc
   flag_validators.cc
-  group_varint.cc
   pstack_watcher.cc
   hdr_histogram.cc
   hexdump.cc
   init.cc
-  jsonreader.cc
   jsonwriter.cc
   kernel_stack_watchdog.cc
   locks.cc
   logging.cc
-  maintenance_manager.cc
-  maintenance_manager_metrics.cc
   malloc.cc
   memcmpable_varint.cc
   memory/arena.cc
@@ -219,7 +210,6 @@ set(UTIL_SRCS
   memory/overwrite.cc
   mem_tracker.cc
   metrics.cc
-  minidump.cc
   monotime.cc
   mutex.cc
   net/dns_resolver.cc
@@ -237,13 +227,11 @@ set(UTIL_SRCS
   process_memory.cc
   prometheus_writer.cc
   random_util.cc
-  rolling_log.cc
   rw_mutex.cc
   rwc_lock.cc
   ${SEMAPHORE_CC}
   signal.cc
   slice.cc
-  slru_cache.cc
   spinlock_profiling.cc
   status.cc
   status_callback.cc
@@ -255,7 +243,6 @@ set(UTIL_SRCS
   threadlocal.cc
   threadpool.cc
   thread_restrictions.cc
-  throttler.cc
   trace.cc
   trace_metrics.cc
   user.cc
@@ -263,10 +250,27 @@ set(UTIL_SRCS
   version_info.cc
   version_util.cc
   web_callback_registry.cc
-  website_util.cc
-  yamlreader.cc
-  zlib.cc
 )
+
+if (NOT KUDU_CLIENT_ONLY)
+  set(UTIL_SRCS ${UTIL_SRCS}
+    async_logger.cc
+    block_cache_metrics.cc
+    cow_object.cc
+    file_cache.cc
+    file_cache_metrics.cc
+    group_varint.cc
+    jsonreader.cc
+    maintenance_manager.cc
+    maintenance_manager_metrics.cc
+    minidump.cc
+    rolling_log.cc
+    slru_cache.cc
+    throttler.cc
+    website_util.cc
+    yamlreader.cc
+    zlib.cc)
+endif()
 
 if (KUDU_HAS_DIAGNOSTIC_SOCKET)
   set(UTIL_SRCS ${UTIL_SRCS} net/diagnostic_socket.cc)
@@ -305,6 +309,36 @@ else()
   message("Compiler does not support AVX2")
 endif()
 
+# See the comment in sanitizer_options.cc for details on this library's usage.
+# The top-level CMakeLists sets a ${SANITIZER_OPTIONS_OVERRIDE} variable which
+# should be linked first into all Kudu binaries.
+
+#######################################
+# sanitizer_options
+#######################################
+if ("${KUDU_USE_ASAN}" OR "${KUDU_USE_TSAN}" OR "${KUDU_USE_UBSAN}")
+  add_library(sanitizer_options STATIC sanitizer_options.cc)
+  target_link_libraries(sanitizer_options gutil)
+  # By default the sanitizers use addr2line utility to symbolize reports.
+  # llvm-symbolizer is faster, consumes less memory and produces much better reports.
+  # We set KUDU_EXTERNAL_SYMBOLIZER_PATH which is used in sanitizer_options.cc
+  # to set the default external_symbolizer_path.
+  SET(KUDU_LLVM_SYMBOLIZER_PATH ${THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR}/bin/llvm-symbolizer)
+  if (EXISTS ${KUDU_LLVM_SYMBOLIZER_PATH})
+    target_compile_definitions(sanitizer_options PRIVATE KUDU_EXTERNAL_SYMBOLIZER_PATH=${KUDU_LLVM_SYMBOLIZER_PATH})
+  else()
+    message(SEND_ERROR
+      "Could not find llvm-symbolizer required for sanitizer builds at ${KUDU_LLVM_SYMBOLIZER_PATH}")
+  endif()
+endif()
+
+#######################################
+# protoc-gen-insertions
+#######################################
+
+add_executable(protoc-gen-insertions protoc-gen-insertions.cc)
+target_link_libraries(protoc-gen-insertions gutil protobuf protoc ${KUDU_BASE_LIBS})
+
 set(UTIL_LIBS
   block_bloom_filter_proto
   crcutil
@@ -322,10 +356,13 @@ set(UTIL_LIBS
   openssl_ssl
   socket_info_proto
   version_info_proto
-  yaml
   zlib)
 
-if(NOT APPLE)
+if(NOT KUDU_CLIENT_ONLY)
+  set(UTIL_LIBS ${UTIL_LIBS} yaml)
+endif()
+
+if(NOT APPLE AND NOT KUDU_CLIENT_ONLY)
   set(UTIL_LIBS
     ${UTIL_LIBS}
     breakpad_client
@@ -378,6 +415,10 @@ target_link_libraries(kudu_curl_util
   glog
   gutil)
 
+if (KUDU_CLIENT_ONLY)
+  return()
+endif()
+
 #######################################
 # kudu_cloud_util
 #######################################
@@ -401,7 +442,7 @@ target_link_libraries(kudu_jwt_util
 # mini_oidc
 #######################################
 # The mini_oidc is used only for tests.
-if (KUDU_CLI_TEST_TOOL_ENABLED)
+if (KUDU_CLI_TEST_TOOL_ENABLED AND NOT KUDU_CLIENT_ONLY)
   add_library(mini_oidc mini_oidc.cc)
   target_link_libraries(mini_oidc
     server_process
@@ -439,36 +480,6 @@ if (KUDU_CLI_TEST_TOOL_ENABLED)
   target_link_libraries(jwt_test_certs
     kudu_jwt_util)
 endif()
-
-# See the comment in sanitizer_options.cc for details on this library's usage.
-# The top-level CMakeLists sets a ${SANITIZER_OPTIONS_OVERRIDE} variable which
-# should be linked first into all Kudu binaries.
-
-#######################################
-# sanitizer_options
-#######################################
-if ("${KUDU_USE_ASAN}" OR "${KUDU_USE_TSAN}" OR "${KUDU_USE_UBSAN}")
-  add_library(sanitizer_options STATIC sanitizer_options.cc)
-  target_link_libraries(sanitizer_options gutil)
-  # By default the sanitizers use addr2line utility to symbolize reports.
-  # llvm-symbolizer is faster, consumes less memory and produces much better reports.
-  # We set KUDU_EXTERNAL_SYMBOLIZER_PATH which is used in sanitizer_options.cc
-  # to set the default external_symbolizer_path.
-  SET(KUDU_LLVM_SYMBOLIZER_PATH ${THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR}/bin/llvm-symbolizer)
-  if (EXISTS ${KUDU_LLVM_SYMBOLIZER_PATH})
-    target_compile_definitions(sanitizer_options PRIVATE KUDU_EXTERNAL_SYMBOLIZER_PATH=${KUDU_LLVM_SYMBOLIZER_PATH})
-  else()
-    message(SEND_ERROR
-      "Could not find llvm-symbolizer required for sanitizer builds at ${KUDU_LLVM_SYMBOLIZER_PATH}")
-  endif()
-endif()
-
-#######################################
-# protoc-gen-insertions
-#######################################
-
-add_executable(protoc-gen-insertions protoc-gen-insertions.cc)
-target_link_libraries(protoc-gen-insertions gutil protobuf protoc ${KUDU_BASE_LIBS})
 
 #######################################
 # kudu_test_util
