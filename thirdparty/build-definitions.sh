@@ -1054,13 +1054,16 @@ build_thrift() {
 
   # Thrift depends on bison.
   #
-  # Configure for a very minimal install - only the C++ client libraries are needed.
-  # Thrift requires C++11 when compiled on Linux against libc++ (see cxxfunctional.h).
-  CFLAGS="$EXTRA_CFLAGS" \
-    CFLAGS="$EXTRA_CFLAGS -fPIC" \
-    CXXFLAGS="$EXTRA_CXXFLAGS -fPIC -std=c++17" \
-    LDFLAGS="$EXTRA_LDFLAGS" \
-    LIBS="$EXTRA_LIBS" \
+  # Configure for a very minimal install: we need only the Thrift compiler and
+  # C++ client libraries with TSL/SSL support (explicitly added WITH_OPENSSL=ON
+  # to enable the latter).
+  # Thrift requires at least C++11 when compiled on Linux against libc++
+  # (see cxxfunctional.h), but Kudu requires at least C++17-compatible
+  # compiler anyway: added -DCMAKE_CXX_STANDARD=17 and -std=c++17 for clarity.
+  CFLAGS="$EXTRA_CFLAGS -fPIC" \
+  CXXFLAGS="$EXTRA_CXXFLAGS -fPIC -std=c++17" \
+  LDFLAGS="$EXTRA_LDFLAGS" \
+  LIBS="$EXTRA_LIBS" \
     cmake \
     -DBOOST_ROOT=$PREFIX \
     -DBUILD_AS3=OFF \
@@ -1076,9 +1079,9 @@ build_thrift() {
     -DBUILD_TUTORIALS=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_CXX_STANDARD=17 \
     -DWITH_LIBEVENT=OFF \
-    -DWITH_OPENSSL=OFF \
-    -DWITH_PLUGIN=OFF \
+    -DWITH_OPENSSL=ON \
     -DWITH_QT5=OFF \
     -DWITH_ZLIB=OFF \
     $EXTRA_CMAKE_FLAGS \
