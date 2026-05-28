@@ -147,6 +147,7 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       enable_kerberos(false),
       principal("kudu"),
       hms_mode(HmsMode::NONE),
+      enable_hms_tls(false),
       enable_ranger(false),
       enable_ranger_kms(false),
       ranger_cluster_key("kuduclusterkey"),
@@ -440,6 +441,10 @@ Status ExternalMiniCluster::Start() {
 
     if (opts_.hms_mode == HmsMode::DISABLE_HIVE_METASTORE) {
       hms_->EnableKuduPlugin(false);
+    }
+
+    if (opts_.enable_hms_tls) {
+      hms_->EnableTls(true);
     }
 
     if (opts_.enable_kerberos) {

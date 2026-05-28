@@ -35,7 +35,6 @@
 
 #include "kudu/common/common.pb.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/security/test/mini_kdc.h"
@@ -250,6 +249,12 @@ struct ExternalMiniClusterOptions {
   //
   // Default: HmsMode::NONE.
   HmsMode hms_mode;
+
+  // If true, enable SSL/TLS for the Hive Metastore started as part of this
+  // ExternalMiniCluster.
+  //
+  // Default: false.
+  bool enable_hms_tls;
 
   // If true, set up a Ranger service as part of this ExternalMiniCluster.
   //

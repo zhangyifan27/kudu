@@ -22,7 +22,6 @@
 #include <memory>
 #include <string>
 
-#include "kudu/gutil/port.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -46,6 +45,9 @@ class MiniHms {
                       std::string service_principal,
                       std::string keytab_file,
                       rpc::SaslProtection::Type protection);
+
+  // Configures whether the mini HMS uses SSL/TLS for its Thrift interface.
+  void EnableTls(bool enable);
 
   // Configures the mini HMS to enable or disable the Kudu plugin.
   void EnableKuduPlugin(bool enable);
@@ -90,6 +92,11 @@ class MiniHms {
     return !keytab_file_.empty();
   }
 
+  // Returns true when SSL/TLS is enabled.
+  bool IsTlsEnabled() const {
+    return tls_enabled_;
+  }
+
  private:
 
   // Creates a security.properties file for use via `-Djava.security.properties` in the mini HMS.
@@ -104,6 +111,9 @@ class MiniHms {
   // Creates a log4j2 configuration properties file for the mini HMS.
   Status CreateLogConfig() const;
 
+  // Creates the keystore files required for the mini HMS's SSL/TLS endpoint.
+  Status CreateTlsKeyStore(const std::string& java_home);
+
   std::unique_ptr<Subprocess> hms_process_;
   MonoDelta notification_log_ttl_ = MonoDelta::FromSeconds(86400);
   uint16_t port_ = 0;
@@ -117,6 +127,11 @@ class MiniHms {
   std::string service_principal_;
   std::string keytab_file_;
   rpc::SaslProtection::Type protection_ = rpc::SaslProtection::kAuthentication;
+
+  // SSL/TLS configuration
+  bool tls_enabled_ = false;
+  std::string key_store_path_;
+  std::string key_store_password_;
 
   // Whether to enable the Kudu listener plugin.
   bool enable_kudu_plugin_ = true;

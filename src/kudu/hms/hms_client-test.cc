@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
@@ -34,10 +35,14 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/thrift/client.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/path_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -89,6 +94,31 @@ class HmsClientTest : public KuduTest,
     hive::EnvironmentContext env_ctx;
     env_ctx.__set_properties({ make_pair(HmsClient::kKuduTableIdKey, table_id) });
     return client->DropTable(database_name, table_name, env_ctx);
+  }
+
+  void CheckMiniHmsTlsConfig(bool enable_tls) {
+    MiniHms hms;
+    const string data_root = GetTestPath(Substitute("hms-$0", enable_tls ? "tls" : "plain"));
+    ASSERT_OK(env_->CreateDir(data_root));
+    hms.SetDataRoot(data_root);
+    hms.EnableKuduPlugin(false);
+    if (enable_tls) {
+      hms.EnableTls(true);
+    }
+
+    ASSERT_OK(hms.Start());
+    SCOPED_CLEANUP({ WARN_NOT_OK(hms.Stop(), "failed to stop MiniHms"); });
+
+    faststring hive_site;
+    ASSERT_OK(ReadFileToString(env_, JoinPathSegments(data_root, "hive-site.xml"), &hive_site));
+    if (enable_tls) {
+      ASSERT_STR_CONTAINS(
+          hive_site.ToString(),
+          "<name>hive.metastore.use.SSL</name>\n    <value>true</value>");
+    } else {
+      ASSERT_STR_NOT_CONTAINS(hive_site.ToString(), "hive.metastore.use.SSL");
+    }
+    ASSERT_EQ(enable_tls, env_->FileExists(JoinPathSegments(data_root, "server-keystore.p12")));
   }
 };
 
@@ -405,6 +435,13 @@ TEST_F(HmsClientTest, TestHmsFaultHandling) {
   // Unpause the HMS and ensure the client can continue.
   ASSERT_OK(hms.Resume());
   ASSERT_OK(client.GetDatabase("default", &my_db));
+}
+
+// TODO(zchovan): replace this with a test that actually connects
+// to the HMS and verifies the TLS configuration.
+TEST_F(HmsClientTest, TestMiniHmsTlsConfig) {
+  CheckMiniHmsTlsConfig(false);
+  CheckMiniHmsTlsConfig(true);
 }
 
 // Test connecting the HMS client to TCP sockets in various invalid states.

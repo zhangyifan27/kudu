@@ -17,12 +17,13 @@
 
 #include "kudu/hms/mini_hms.h"
 
-#include <algorithm>
 #include <csignal>
 #include <map>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -30,6 +31,7 @@
 #include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
@@ -40,9 +42,11 @@ using kudu::rpc::SaslProtection;
 using std::map;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 
 static constexpr int kHmsStartTimeoutMs = 60000;
+static constexpr const char* kHmsTlsKeyStorePassword = "storepass";
 
 namespace kudu {
 namespace hms {
@@ -66,6 +70,11 @@ void MiniHms::EnableKerberos(string krb5_conf,
   service_principal_ = std::move(service_principal);
   keytab_file_ = std::move(keytab_file);
   protection_ = protection;
+}
+
+void MiniHms::EnableTls(bool enable) {
+  CHECK(!hms_process_);
+  tls_enabled_ = enable;
 }
 
 void MiniHms::EnableKuduPlugin(bool enable) {
@@ -102,6 +111,10 @@ Status MiniHms::Start() {
 
   if (data_root_.empty()) {
     data_root_ = GetTestDataDirectory();
+  }
+
+  if (IsTlsEnabled()) {
+    RETURN_NOT_OK(CreateTlsKeyStore(java_home));
   }
 
   RETURN_NOT_OK(CreateSecurityProperties());
@@ -236,6 +249,154 @@ Status MiniHms::CreateSecurityProperties() const {
                            JoinPathSegments(data_root_, "security.properties"));
 }
 
+Status MiniHms::CreateTlsKeyStore(const string& java_home) {
+  constexpr const char* kCaAlias = "mini-hms-ca";
+  constexpr const char* kServerAlias = "mini-hms-server";
+  const string ca_key_store = JoinPathSegments(data_root_, "ca-keystore.p12");
+  const string server_key_store = JoinPathSegments(data_root_, "server-keystore.p12");
+  const string ca_cert = JoinPathSegments(data_root_, "ca-cert.pem");
+  const string server_csr = JoinPathSegments(data_root_, "mini-hms-server-csr.pem");
+  const string server_cert = JoinPathSegments(data_root_, "mini-hms-server-cert.pem");
+  // The marker is written only after all keytool steps succeed, so a retry can
+  // distinguish a complete keystore from artifacts left by a partial attempt.
+  const string success_marker = JoinPathSegments(data_root_, "mini-hms-tls-keystore-ready");
+  const vector<string> tls_artifacts = {
+      ca_key_store, server_key_store, ca_cert, server_csr, server_cert, success_marker
+  };
+
+  key_store_path_ = server_key_store;
+  key_store_password_ = kHmsTlsKeyStorePassword;
+
+  Env* env = Env::Default();
+  if (env->FileExists(success_marker)) {
+    return Status::OK();
+  }
+
+  // Clean up leftovers from an earlier failed attempt before invoking keytool.
+  for (const auto& path : tls_artifacts) {
+    if (env->FileExists(path)) {
+      RETURN_NOT_OK(env->DeleteFile(path));
+    }
+  }
+
+  auto delete_tls_artifacts = MakeScopedCleanup([&] {
+    for (const auto& path : tls_artifacts) {
+      if (env->FileExists(path)) {
+        WARN_NOT_OK(env->DeleteFile(path),
+                    Substitute("failed to delete TLS artifact $0", path));
+      }
+    }
+  });
+
+  const string keytool = JoinPathSegments(java_home, "bin/keytool");
+  auto run_keytool = [&keytool](const vector<string>& args) {
+    vector<string> cmd;
+    cmd.reserve(args.size() + 1);
+    cmd.emplace_back(keytool);
+    cmd.insert(cmd.end(), args.begin(), args.end());
+    return Subprocess::Call(cmd, "", nullptr, nullptr);
+  };
+
+  // -----------------------------------------------------------------------------
+  // Generating CA certificate
+  // -----------------------------------------------------------------------------
+
+  // Generating private key and certificate for the root CA
+  RETURN_NOT_OK(run_keytool({
+      "-genkeypair",
+      "-alias", kCaAlias,
+      "-storetype", "PKCS12",
+      "-keyalg", "RSA",
+      "-keysize", "2048",
+      "-keystore", ca_key_store,
+      "-storepass", key_store_password_,
+      "-keypass", key_store_password_,
+      "-dname", "CN=127.0.0.1,OU=Kudu,O=Apache,L=CA,S=Sunnyvale,C=US",
+      "-ext", "BasicConstraints:critical=ca:true",
+      "-validity", "365",
+  }));
+
+  // Exporting the generated CA certificate (needed for the import below)
+  RETURN_NOT_OK(run_keytool({
+      "-exportcert",
+      "-rfc",
+      "-alias", kCaAlias,
+      "-keystore", ca_key_store,
+      "-storepass", key_store_password_,
+      "-file", ca_cert,
+  }));
+
+  // -----------------------------------------------------------------------------
+  // Generating server certificate
+  // -----------------------------------------------------------------------------
+
+  // Creating key pair for server certificate
+  RETURN_NOT_OK(run_keytool({
+      "-genkeypair",
+      "-alias", kServerAlias,
+      "-keystore", server_key_store,
+      "-storepass", key_store_password_,
+      "-keypass", key_store_password_,
+      "-keyalg", "RSA",
+      "-keysize", "2048",
+      "-dname", "CN=127.0.0.1",
+      "-ext", "SAN=ip:127.0.0.1",
+      "-validity", "365",
+      "-storetype", "pkcs12",
+  }));
+
+  // Creating a CSR for server certificate
+  RETURN_NOT_OK(run_keytool({
+      "-certreq",
+      "-alias", kServerAlias,
+      "-keystore", server_key_store,
+      "-storepass", key_store_password_,
+      "-ext", "SAN=ip:127.0.0.1",
+      "-file", server_csr,
+  }));
+
+  // Signing the server certificate
+  RETURN_NOT_OK(run_keytool({
+      "-gencert",
+      "-infile", server_csr,
+      "-keystore", ca_key_store,
+      "-storepass", key_store_password_,
+      "-alias", kCaAlias,
+      "-ext", "SAN=ip:127.0.0.1",
+      "-outfile", server_cert,
+  }));
+
+  // Adding the CA certificate to truststore for the server-side
+  RETURN_NOT_OK(run_keytool({
+      "-importcert",
+      "-trustcacerts",
+      "-alias", kCaAlias,
+      "-keystore", server_key_store,
+      "-storepass", key_store_password_,
+      "-file", ca_cert,
+      "-noprompt",
+  }));
+
+  // Adding server certificate to keystore
+  RETURN_NOT_OK(run_keytool({
+      "-importcert",
+      "-alias", kServerAlias,
+      "-keystore", server_key_store,
+      "-storepass", key_store_password_,
+      "-file", server_cert,
+      "-noprompt",
+  }));
+
+  WritableFileOptions opts;
+  opts.mode = Env::MUST_CREATE;
+  opts.sync_on_close = true;
+  unique_ptr<WritableFile> marker_file;
+  RETURN_NOT_OK(env->NewWritableFile(opts, success_marker, &marker_file));
+  RETURN_NOT_OK(marker_file->Close());
+  delete_tls_artifacts.cancel();
+  return Status::OK();
+}
+
 Status MiniHms::CreateHiveSite() const {
 
   const string listeners = Substitute("org.apache.hive.hcatalog.listener.DbNotificationListener$0",
@@ -249,6 +410,11 @@ Status MiniHms::CreateHiveSite() const {
   // - hive.metastore.kerberos.keytab.file
   // - hive.metastore.kerberos.principal
   //     Configures the HMS to use Kerberos for its Thrift RPC interface.
+  //
+  // - hive.metastore.use.SSL
+  // - hive.metastore.keystore.path
+  // - hive.metastore.keystore.password
+  //     Configures the HMS to use SSL/TLS for its Thrift RPC interface.
   //
   // - hive.metastore.disallow.incompatible.col.type.changes
   //     Configures the HMS to allow altering and dropping columns.
@@ -313,6 +479,8 @@ Status MiniHms::CreateHiveSite() const {
     <value>$6</value>
   </property>
 
+$9
+
   <property>
     <name>hive.metastore.disallow.incompatible.col.type.changes</name>
     <value>false</value>
@@ -340,6 +508,27 @@ Status MiniHms::CreateHiveSite() const {
 </configuration>
   )";
 
+  static const string kTlsEnabledConfigTemplate = R"(
+  <property>
+    <name>hive.metastore.use.SSL</name>
+    <value>true</value>
+  </property>
+
+  <property>
+    <name>hive.metastore.keystore.path</name>
+    <value>$0</value>
+  </property>
+
+  <property>
+    <name>hive.metastore.keystore.password</name>
+    <value>$1</value>
+  </property>
+)";
+
+  const string tls_config = IsTlsEnabled()
+      ? Substitute(kTlsEnabledConfigTemplate, key_store_path_, key_store_password_)
+      : "";
+
   string hive_file_contents = Substitute(kHiveFileTemplate,
                                          listeners,
                                          notification_log_ttl_.ToSeconds(),
@@ -349,7 +538,8 @@ Status MiniHms::CreateHiveSite() const {
                                          service_principal_,
                                          SaslProtection::name_of(protection_),
                                          JoinPathSegments(data_root_, "hive-log4j2.properties"),
-                                         metadb_subdir_);
+                                         metadb_subdir_,
+                                         tls_config);
 
   return WriteStringToFile(Env::Default(),
                            hive_file_contents,
