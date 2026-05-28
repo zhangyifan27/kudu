@@ -59,8 +59,10 @@ DECLARE_string(hive_metastore_uris);
 using kudu::client::KuduTable;
 using kudu::client::KuduTableAlterer;
 using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::hms::HmsClient;
+using kudu::hms::MiniHms;
 using kudu::transactions::TxnSystemClient;
 using std::nullopt;
 using std::optional;
@@ -79,17 +81,57 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
 
     ExternalMiniClusterOptions opts;
     opts.hms_mode = GetHmsMode();
+    opts.enable_hms_tls = IsTlsEnabled();
     opts.num_masters = 1;
     opts.num_tablet_servers = 1;
-    opts.enable_kerberos = EnableKerberos();
+    opts.enable_kerberos = IsKerberosEnabled();
     opts.principal = Principal();
+
+    auto& emf = opts.extra_master_flags;
     // Tune down the notification log poll period in order to speed up catalog convergence.
-    opts.extra_master_flags.emplace_back("--hive_metastore_notification_log_poll_period_seconds=1");
+    emf.emplace_back("--hive_metastore_notification_log_poll_period_seconds=1");
+
+    // The code below assumes that the cluster root isn't customized.
+    ASSERT_TRUE(opts.cluster_root.empty());
+
+    // Set the relevant flags for TLS support in HmsClient. It's necessary to
+    // provide the location to the file with trusted CA certificates, but the
+    // file is generated upon MiniHms start-up. However, the file isn't used
+    // until HmsClient establishes very first Thrift connection to the HMS.
+    // Using --trusted_certificate_file to exercise the default settings
+    // for the --hive_metastore_tls_use_https_trusted_ca_cert flag.
+    //
+    // NOTE: In case of possible conflicts with a newly added scenario that need
+    // to set trusted CA certificates for HTTPS-based transports such as KMS,
+    // switch particular test scenarios to using the dedicated flag
+    // --hive_metastore_tls_use_https_trusted_ca_cert instead.
+    const auto cluster_root = ExternalMiniCluster::GetDefaultClusterRoot();
+    const auto hms_ca_cert_fpath = MiniHms::BuildCaCertFilePath(cluster_root);
+    if (IsTlsEnabled()) {
+      emf.emplace_back("--hive_metastore_tls_enabled");
+      emf.emplace_back("--hive_metastore_tls_use_https_trusted_ca_cert");
+      emf.emplace_back(Substitute("--trusted_certificate_file=$0",
+                                  hms_ca_cert_fpath));
+    }
+
     SetFlags(&opts);
     StartClusterWithOpts(std::move(opts));
+    ASSERT_EQ(cluster_root, cluster_->cluster_root());
+
+    if (IsTlsEnabled()) {
+      // Sanity check: make sure the path provided to started master(s) via the
+      // --hive_metastore_tls_trusted_ca_cert_file flag points to the location
+      // where MiniHms actually put the file it generated upon starting up.
+      ASSERT_EQ(hms_ca_cert_fpath, cluster_->hms()->ca_cert_file_path());
+    }
+
     thrift::ClientOptions hms_opts;
-    hms_opts.enable_kerberos = EnableKerberos();
+    hms_opts.enable_kerberos = IsKerberosEnabled();
     hms_opts.service_principal = "hive";
+    hms_opts.enable_tls = IsTlsEnabled();
+    if (hms_opts.enable_tls) {
+      hms_opts.tls_trusted_ca_cert_file = hms_ca_cert_fpath;
+    }
     ASSERT_OK(harness_.RestartHmsClient(cluster_, hms_opts));
   }
 
@@ -175,7 +217,11 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
     return HmsMode::ENABLE_METASTORE_INTEGRATION;
   }
 
-  virtual bool EnableKerberos() {
+  virtual bool IsKerberosEnabled() const {
+    return false;
+  }
+
+  virtual bool IsTlsEnabled() const {
     return false;
   }
 
@@ -186,7 +232,22 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
   virtual void SetFlags(ExternalMiniClusterOptions* opts) const {}
 };
 
-TEST_F(MasterHmsTest, TestCreateTable) {
+// A test class parameterized on whether TLS support is enabled or not for
+// HMS Thrift connections.
+class MasterHmsTlsParamTest :
+    public MasterHmsTest,
+    public ::testing::WithParamInterface<bool> {
+ protected:
+  bool IsTlsEnabled() const override {
+    return GetParam();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(,
+                         MasterHmsTlsParamTest,
+                         ::testing::Bool());
+
+TEST_P(MasterHmsTlsParamTest, TestCreateTable) {
   const char* hms_database_name = "create_db";
   const char* hms_table_name = "table";
   string table_name = Substitute("$0.$1", hms_database_name, hms_table_name);
@@ -237,7 +298,7 @@ TEST_F(MasterHmsTest, TestCreateTable) {
   NO_FATALS(CheckTable(hms_database_name, "foo", /*user=*/nullopt));
 }
 
-TEST_F(MasterHmsTest, TestRenameTable) {
+TEST_P(MasterHmsTlsParamTest, TestRenameTable) {
   // Create the database and Kudu table.
   ASSERT_OK(CreateDatabase("db"));
   ASSERT_OK(CreateKuduTable("db", "a"));
@@ -322,7 +383,7 @@ TEST_F(MasterHmsTest, TestRenameTable) {
   NO_FATALS(CheckTableDoesNotExist("db1", "t2"));
 }
 
-TEST_F(MasterHmsTest, TestAlterTableOwner) {
+TEST_P(MasterHmsTlsParamTest, TestAlterTableOwner) {
   // Create the Kudu table.
   ASSERT_OK(CreateKuduTable("default", "userTable"));
   NO_FATALS(CheckTable("default", "userTable", /*user=*/ nullopt));
@@ -343,7 +404,7 @@ TEST_F(MasterHmsTest, TestAlterTableOwner) {
   });
 }
 
-TEST_F(MasterHmsTest, TestAlterTableComment) {
+TEST_P(MasterHmsTlsParamTest, TestAlterTableComment) {
   // Create the Kudu table.
   ASSERT_OK(CreateKuduTable("default", "commentTable"));
   NO_FATALS(CheckTable("default", "commentTable", /*user=*/ nullopt));
@@ -364,7 +425,7 @@ TEST_F(MasterHmsTest, TestAlterTableComment) {
   });
 }
 
-TEST_F(MasterHmsTest, TestAlterTable) {
+TEST_P(MasterHmsTlsParamTest, TestAlterTable) {
   // Create the Kudu table.
   ASSERT_OK(CreateKuduTable("default", "a"));
   NO_FATALS(CheckTable("default", "a", /*user=*/ nullopt));
@@ -420,7 +481,7 @@ TEST_F(MasterHmsTest, TestAlterTable) {
   ASSERT_OK(harness_.hms_client()->GetTable("default", "a", &hms_table));
 }
 
-TEST_F(MasterHmsTest, TestDeleteTable) {
+TEST_P(MasterHmsTlsParamTest, TestDeleteTable) {
   // Create a Kudu table, then drop it from Kudu and ensure the HMS entry is removed.
   ASSERT_OK(CreateKuduTable("default", "a"));
   NO_FATALS(CheckTable("default", "a", /*user=*/ nullopt));
@@ -487,7 +548,7 @@ TEST_F(MasterHmsTest, TestDeleteTable) {
 
 // Test to verify that the soft-deletion of tables is not supported when
 // HMS is enabled.
-TEST_F(MasterHmsTest, TableSoftDeleteNotSupportedWithHmsEnabled) {
+TEST_P(MasterHmsTlsParamTest, TableSoftDeleteNotSupportedWithHmsEnabled) {
   // TODO(kedeng) : change the test case when state sync to HMS
   // Create a Kudu table, then soft delete it from Kudu.
   ASSERT_OK(CreateKuduTable("default", "a"));
@@ -515,7 +576,7 @@ TEST_F(MasterHmsTest, TableSoftDeleteNotSupportedWithHmsEnabled) {
 // tables has been introduced. There might be other scenarios elsewhere testing
 // for that implicitly, but this scenario is run explicitly to check for the
 // backward compatibility in that context.
-TEST_F(MasterHmsTest, AlterAndDeleteTableWhenHmsEnabled) {
+TEST_P(MasterHmsTlsParamTest, AlterAndDeleteTableWhenHmsEnabled) {
   // Create the database and Kudu table.
   ASSERT_OK(CreateDatabase("db"));
   ASSERT_OK(CreateKuduTable("db", "a"));
@@ -534,7 +595,7 @@ TEST_F(MasterHmsTest, AlterAndDeleteTableWhenHmsEnabled) {
   NO_FATALS(CheckTableDoesNotExist("db", "b"));
 }
 
-TEST_F(MasterHmsTest, TestNotificationLogListener) {
+TEST_P(MasterHmsTlsParamTest, TestNotificationLogListener) {
   // Create a Kudu table.
   ASSERT_OK(CreateKuduTable("default", "a"));
   NO_FATALS(CheckTable("default", "a", /*user=*/ nullopt));
@@ -617,7 +678,7 @@ TEST_F(MasterHmsTest, TestNotificationLogListener) {
   });
 }
 
-TEST_F(MasterHmsTest, TestIgnoreExternalTables) {
+TEST_P(MasterHmsTlsParamTest, TestIgnoreExternalTables) {
   // Set up a managed table, and a couple of external tables to point at it.
   ASSERT_OK(CreateKuduTable("default", "managed"));
   const string kManagedTableName = "default.managed";
@@ -648,7 +709,7 @@ TEST_F(MasterHmsTest, TestIgnoreExternalTables) {
   ASSERT_EQ(kManagedTableName, ext.parameters[HmsClient::kKuduTableNameKey]);
 }
 
-TEST_F(MasterHmsTest, TestIgnoreOtherClusterIds) {
+TEST_P(MasterHmsTlsParamTest, TestIgnoreOtherClusterIds) {
   // Set up a few tables.
   ASSERT_OK(CreateKuduTable("default", "same"));
   ASSERT_OK(CreateKuduTable("default", "other"));
@@ -710,7 +771,7 @@ TEST_F(MasterHmsTest, TestIgnoreOtherClusterIds) {
   });
 }
 
-TEST_F(MasterHmsTest, TestUppercaseIdentifiers) {
+TEST_P(MasterHmsTlsParamTest, TestUppercaseIdentifiers) {
   ASSERT_OK(CreateKuduTable("default", "MyTable"));
   NO_FATALS(CheckTable("default", "MyTable", /*user=*/nullopt));
   NO_FATALS(CheckTable("default", "mytable", /*user=*/nullopt));
@@ -764,7 +825,7 @@ TEST_F(MasterHmsTest, TestUppercaseIdentifiers) {
 
 // Test that we can create a transaction status table that doesn't get
 // synchronized to the HMS.
-TEST_F(MasterHmsTest, TestTransactionStatusTableDoesntSync) {
+TEST_P(MasterHmsTlsParamTest, TestTransactionStatusTableDoesntSync) {
   // Create a transaction status table.
   unique_ptr<TxnSystemClient> txn_sys_client;
   ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
@@ -860,7 +921,7 @@ TEST_F(MasterHmsUpgradeTest, TestRenameExistingTables) {
 
 class MasterHmsKerberizedTest : public MasterHmsTest {
  public:
-  bool EnableKerberos() override {
+  bool IsKerberosEnabled() const override {
     return true;
   }
   string Principal() override {

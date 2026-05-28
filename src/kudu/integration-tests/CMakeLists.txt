@@ -101,7 +101,7 @@ ADD_KUDU_TEST(master_cert_authority-itest PROCESSORS 2)
 ADD_KUDU_TEST(master_failover-itest NUM_SHARDS 4 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(master_failover-itest
   kudu)
-ADD_KUDU_TEST(master_hms-itest RUN_SERIAL true PROCESSORS 4)
+ADD_KUDU_TEST(master_hms-itest RUN_SERIAL true NUM_SHARDS 6 PROCESSORS 4)
 ADD_KUDU_TEST(master_migration-itest)
 ADD_KUDU_TEST_DEPENDENCIES(master_migration-itest
   kudu)

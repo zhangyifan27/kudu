@@ -105,7 +105,9 @@ class HmsITestHarness {
 
   Status RestartHmsClient(const std::unique_ptr<cluster::ExternalMiniCluster>& cluster,
                           const thrift::ClientOptions& hms_opts) {
-    hms_client_.reset(new hms::HmsClient(cluster->hms()->address(), hms_opts));
+    std::unique_ptr<hms::HmsClient> client;
+    RETURN_NOT_OK(hms::HmsClient::New(cluster->hms()->address(), hms_opts, &client));
+    hms_client_ = std::move(client);
     return hms_client_->Start();
   }
 

@@ -36,6 +36,10 @@ namespace hms {
 class MiniHms {
  public:
 
+  // Build path to the file with trusted CA certificates for the specified
+  // data root.
+  static std::string BuildCaCertFilePath(const std::string& data_root);
+
   MiniHms();
 
   ~MiniHms();
@@ -97,6 +101,13 @@ class MiniHms {
     return tls_enabled_;
   }
 
+  // Returns absolute path to the file with the CA certificate (PEM format)
+  // that the Thrift server's TLS certificate is signed with.
+  std::string ca_cert_file_path() const;
+
+  // Returns absolute path to HMS's JKS CA keystore location.
+  std::string ca_keystore_path() const;
+
  private:
 
   // Creates a security.properties file for use via `-Djava.security.properties` in the mini HMS.
@@ -128,7 +139,8 @@ class MiniHms {
   std::string keytab_file_;
   rpc::SaslProtection::Type protection_ = rpc::SaslProtection::kAuthentication;
 
-  // SSL/TLS configuration
+  // TLS/SSL and keystore-related parameters required to enable TLS-protected
+  // Thrift connections.
   bool tls_enabled_ = false;
   std::string key_store_path_;
   std::string key_store_password_;

@@ -145,9 +145,9 @@ void SaslClientTransport::open() {
     throw SaslException(std::move(s));
   }
   transport_->open();
-  DCHECK(transport_->isOpen());
   try {
     Negotiate();
+    DCHECK(transport_->isOpen());
   } catch (...) {
     transport_->close();
     throw;

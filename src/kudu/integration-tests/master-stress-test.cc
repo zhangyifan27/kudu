@@ -217,7 +217,9 @@ class MasterStressTest : public ExternalMiniClusterITestBase,
     if (std::get<0>(GetParam()) == HmsMode::ENABLE_METASTORE_INTEGRATION) {
       thrift::ClientOptions hms_opts;
       hms_opts.service_principal = "hive";
-      hms_client_.reset(new HmsClient(cluster_->hms()->address(), hms_opts));
+      unique_ptr<HmsClient> client;
+      ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &client));
+      hms_client_ = std::move(client);
       ASSERT_OK(hms_client_->Start());
     }
   }

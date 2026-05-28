@@ -235,10 +235,13 @@ void SmokeExternalMiniCluster(const ExternalMiniClusterOptions& opts,
     thrift::ClientOptions hms_client_opts;
     hms_client_opts.enable_kerberos = opts.enable_kerberos;
     hms_client_opts.service_principal = "hive";
-    hms::HmsClient hms_client(cluster->hms()->address(), hms_client_opts);
-    ASSERT_OK(hms_client.Start());
+
+    unique_ptr<hms::HmsClient> hms_client;
+    ASSERT_OK(hms::HmsClient::New(
+        cluster->hms()->address(), hms_client_opts, &hms_client));
+    ASSERT_OK(hms_client->Start());
     vector<string> tables;
-    ASSERT_OK(hms_client.GetTableNames("default", &tables));
+    ASSERT_OK(hms_client->GetTableNames("default", &tables));
     ASSERT_TRUE(tables.empty()) << "tables: " << tables;
   }
 

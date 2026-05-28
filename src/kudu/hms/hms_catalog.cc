@@ -42,6 +42,7 @@
 #include "kudu/hms/hms_client.h"
 #include "kudu/thrift/client.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
@@ -66,6 +67,28 @@ DEFINE_bool(hive_metastore_sasl_enabled, false,
             "(Kerberos) security. Must match the value of the "
             "hive.metastore.sasl.enabled option in the Hive Metastore configuration. "
             "When enabled, the --keytab_file flag must be provided.");
+
+DEFINE_bool(hive_metastore_tls_enabled, false,
+            "Whether to protect Thrift connections to the Hive Metastore with "
+            "TLS/SSL. Must match the value of the hive.metastore.use.SSL "
+            "option in the Hive Metastore's configuration.");
+
+DEFINE_bool(hive_metastore_tls_use_https_trusted_ca_cert, true,
+            "When set to 'true', Hive Metastore's server TLS certificate is "
+            "verifed against trusted CA certificates that are also used to "
+            "connect to HTTPS API endpoints such as KMS, JWKS, etc. Those "
+            "certificates are sourced from file specified by the "
+            "--trusted_certificate_file flag. When set to 'false', "
+            "--hive_metastore_tls_trusted_ca_cert_file controls the source "
+            "of trusted CA certificates to verify the authenticity of Hive "
+            "Metastore's server TLS certificates.");
+
+DEFINE_string(hive_metastore_tls_trusted_ca_cert_file, "",
+             "The absolute path to a file with trusted CA certificates in PEM "
+             "format to validate Hive Metastore's server certificate. When not "
+             "a single trusted CA certificate is provided, the server TLS "
+             "certificate must be signed by a CA recognized by the system-wide "
+             "CA bundle.");
 
 DEFINE_string(hive_metastore_kerberos_principal, "hive",
               "The service principal of the Hive Metastore server. Must match "
@@ -98,6 +121,43 @@ DEFINE_int32(hive_metastore_max_message_size_bytes, 100 * 1024 * 1024,
              "configuration.");
 TAG_FLAG(hive_metastore_max_message_size_bytes, advanced);
 
+DECLARE_string(trusted_certificate_file);
+
+namespace {
+
+// Return the path to the file with trusted CA certificates for HmsClient.
+const string& GetHmsClientTrustedCACert() {
+  return FLAGS_hive_metastore_tls_use_https_trusted_ca_cert
+      ? FLAGS_trusted_certificate_file
+      : FLAGS_hive_metastore_tls_trusted_ca_cert_file;
+}
+
+}
+
+GROUP_FLAG_VALIDATOR(tls_parameters, []() {
+  if (FLAGS_hive_metastore_tls_enabled) {
+    const auto use_https_ca_cert =
+        FLAGS_hive_metastore_tls_use_https_trusted_ca_cert;
+    const auto& tls_ca_cert_fpath = GetHmsClientTrustedCACert();
+    const char* const ca_cert_flag =
+        use_https_ca_cert ? "--trusted_certificate_file"
+                          : "--hive_metastore_tls_trusted_ca_cert_file";
+    LOG(INFO) << Substitute(
+        "--hive_metastore_tls_use_https_trusted_ca_cert is set to '$0': "
+        "using $1 to load trusted CA certificates for TLS-protected "
+        "Hive Metastore Thrift connections",
+        use_https_ca_cert, ca_cert_flag);
+    if (tls_ca_cert_fpath.empty()) {
+      LOG(WARNING) << Substitute(
+          "--hive_metastore_tls_enabled is set to 'true' but $0 is not set: "
+          "Kudu HMS client will not be able to connect to HMS unless its TLS "
+          "server certificate is recognized by the system-wide CA trust chain",
+          ca_cert_flag);
+    }
+  }
+  return true;
+});
+
 namespace kudu {
 namespace hms {
 
@@ -121,9 +181,12 @@ Status HmsCatalog::Start(HmsClientVerifyKuduSyncConfig verify_service_config) {
   options.conn_timeout = MonoDelta::FromSeconds(FLAGS_hive_metastore_conn_timeout_seconds);
   options.enable_kerberos = FLAGS_hive_metastore_sasl_enabled;
   options.service_principal = FLAGS_hive_metastore_kerberos_principal;
+  options.enable_tls = FLAGS_hive_metastore_tls_enabled;
+  options.tls_trusted_ca_cert_file = GetHmsClientTrustedCACert();
   options.max_buf_size = FLAGS_hive_metastore_max_message_size_bytes;
   options.retry_count = FLAGS_hive_metastore_retry_count;
   options.verify_service_config = verify_service_config == VERIFY;
+
 
   RETURN_NOT_OK(ha_client_.Start(std::move(addresses), std::move(options)));
 

@@ -42,6 +42,7 @@ set(HMS_DEPS
   hms_thrift
   krpc
   kudu_common
+  kudu_curl_util
   kudu_thrift
   kudu_util)
 
@@ -98,8 +99,9 @@ endif()
 SET_KUDU_TEST_LINK_LIBS(
   kudu_hms
   mini_hms
-  mini_kdc)
+  mini_kdc
+  security_test_util)
 
 # These tests must run serially, otherwise starting the HMS can take a very long time.
-ADD_KUDU_TEST(hms_catalog-test RUN_SERIAL true NUM_SHARDS 4)
-ADD_KUDU_TEST(hms_client-test RUN_SERIAL true NUM_SHARDS 4)
+ADD_KUDU_TEST(hms_catalog-test RUN_SERIAL true NUM_SHARDS 6)
+ADD_KUDU_TEST(hms_client-test RUN_SERIAL true NUM_SHARDS 6)

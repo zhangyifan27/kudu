@@ -7392,14 +7392,15 @@ TEST_P(ToolTestKerberosParameterized, TestHmsDowngrade) {
   thrift::ClientOptions hms_opts;
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
   shared_ptr<KuduClient> kudu_client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &kudu_client));
 
   ASSERT_OK(CreateKuduTable(kudu_client, "default.a"));
-  NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "default", "a", master_addr));
+  NO_FATALS(ValidateHmsEntries(hms_client.get(), kudu_client, "default", "a", master_addr));
 
   // Downgrade to legacy table in both Hive Metastore and Kudu.
   // --hive_metastore_uris and --hive_metastore_sasl_enabled are automatically
@@ -7418,7 +7419,7 @@ TEST_P(ToolTestKerberosParameterized, TestHmsDowngrade) {
   shared_ptr<KuduTable> kudu_table;
   ASSERT_OK(kudu_client->OpenTable("default.a", &kudu_table));
   hive::Table hms_table;
-  ASSERT_OK(hms_client.GetTable("default", "a", &hms_table));
+  ASSERT_OK(hms_client->GetTable("default", "a", &hms_table));
 
   // Check that re-upgrading works as expected.
   NO_FATALS(RunActionStdoutNone(Substitute("hms fix $0", master_addr)));
@@ -7464,9 +7465,10 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
   hms_opts.verify_service_config = false;
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -7500,11 +7502,11 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
       kUsername, KuduSchema::ToSchema(control_external->schema()), control_external->comment(),
       HmsClient::kExternalTable));
   hive::Table hms_control_external;
-  ASSERT_OK(hms_client.GetTable("default", "control_external", &hms_control_external));
+  ASSERT_OK(hms_client->GetTable("default", "control_external", &hms_control_external));
   hms_control_external.parameters[HmsClient::kKuduTableIdKey] = control_external->id();
   hms_control_external.parameters[HmsClient::kKuduClusterIdKey] = kudu_client->cluster_id();
   hms_control_external.parameters[HmsClient::kExternalPurgeKey] = "true";
-  ASSERT_OK(hms_client.AlterTable("default", "control_external",
+  ASSERT_OK(hms_client->AlterTable("default", "control_external",
       hms_control_external, master_ctx));
 
   // Test case: Upper-case names are handled specially in a few places.
@@ -7580,7 +7582,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   }
   std::reverse(modified_addrs.begin(), modified_addrs.end());
   LOG(INFO) << "Modified Masters: " << JoinStrings(modified_addrs, ",");
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "orphan_hms_table_masters",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "orphan_hms_table_masters",
       HmsClient::kKuduMasterAddrsKey, JoinStrings(modified_addrs, ",")));
 
   // Test case: orphan external synchronized table in the HMS.
@@ -7589,13 +7591,13 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
       "orphan-hms-cluster-id-external", kUsername,
       SchemaBuilder().Build(), "", HmsClient::kExternalTable));
   hive::Table hms_orphan_external;
-  ASSERT_OK(hms_client.GetTable("default", "orphan_hms_table_external", &hms_orphan_external));
+  ASSERT_OK(hms_client->GetTable("default", "orphan_hms_table_external", &hms_orphan_external));
   hms_orphan_external.parameters[HmsClient::kExternalPurgeKey] = "true";
-  ASSERT_OK(hms_client.AlterTable("default", "orphan_hms_table_external",
+  ASSERT_OK(hms_client->AlterTable("default", "orphan_hms_table_external",
       hms_orphan_external, master_ctx));
 
   // Test case: orphan legacy table in the HMS.
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "orphan_hms_table_legacy_managed",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "orphan_hms_table_legacy_managed",
         "impala::default.orphan_hms_table_legacy_managed",
         master_addrs_str, HmsClient::kManagedTable, kUsername));
 
@@ -7606,23 +7608,23 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   shared_ptr<KuduTable> legacy_managed;
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.legacy_managed", kUsername));
   ASSERT_OK(kudu_client->OpenTable("impala::default.legacy_managed", &legacy_managed));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_managed",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_managed",
       "impala::default.legacy_managed", master_addrs_str, HmsClient::kManagedTable, kUsername));
 
   // Test case: Legacy external purge table.
   shared_ptr<KuduTable> legacy_purge;
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.legacy_purge", kUsername));
   ASSERT_OK(kudu_client->OpenTable("impala::default.legacy_purge", &legacy_purge));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_purge",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_purge",
       "impala::default.legacy_purge", master_addrs_str, HmsClient::kExternalTable, kUsername));
   hive::Table hms_legacy_purge;
-  ASSERT_OK(hms_client.GetTable("default", "legacy_purge", &hms_legacy_purge));
+  ASSERT_OK(hms_client->GetTable("default", "legacy_purge", &hms_legacy_purge));
   hms_legacy_purge.parameters[HmsClient::kExternalPurgeKey] = "true";
-  ASSERT_OK(hms_client.AlterTable("default", "legacy_purge",
+  ASSERT_OK(hms_client->AlterTable("default", "legacy_purge",
                                   hms_legacy_purge, master_ctx));
 
   // Test case: legacy external table (pointed at the legacy managed table).
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_external",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_external",
       "impala::default.legacy_managed", master_addrs_str, HmsClient::kExternalTable, kUsername));
 
   // Test case: legacy managed table with no owner.
@@ -7630,7 +7632,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.legacy_no_owner",
                             static_cast<string>("")));
   ASSERT_OK(kudu_client->OpenTable("impala::default.legacy_no_owner", &legacy_no_owner));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_no_owner",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_no_owner",
         "impala::default.legacy_no_owner", master_addrs_str, HmsClient::kManagedTable,
         nullopt));
 
@@ -7639,14 +7641,14 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "legacy_hive_incompatible_name", kUsername));
   ASSERT_OK(kudu_client->OpenTable("legacy_hive_incompatible_name",
         &legacy_hive_incompatible_name));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_hive_incompatible_name",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_hive_incompatible_name",
         "legacy_hive_incompatible_name", master_addrs_str,
         HmsClient::kManagedTable, kUsername));
 
   // Test case: Kudu table in non-default database.
   hive::Database db;
   db.name = "my_db";
-  ASSERT_OK(hms_client.CreateDatabase(db));
+  ASSERT_OK(hms_client->CreateDatabase(db));
   ASSERT_OK(CreateKuduTable(kudu_client, "my_db.table", kUsername));
 
   // Test case: no owner in HMS
@@ -7823,11 +7825,11 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
     "legacy_external",
     "legacy_hive_incompatible_name",
   }) {
-    NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "default", table, master_addrs_str));
+    NO_FATALS(ValidateHmsEntries(hms_client.get(), kudu_client, "default", table, master_addrs_str));
   }
 
   // Validate the tables in the other databases.
-  NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "my_db", "table", master_addrs_str));
+  NO_FATALS(ValidateHmsEntries(hms_client.get(), kudu_client, "my_db", "table", master_addrs_str));
 
   vector<string> kudu_tables;
   ASSERT_OK(kudu_client->ListTables(&kudu_tables));
@@ -7863,7 +7865,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
         make_pair("different_owner", kUsername),
   })) {
     hive::Table table;
-    ASSERT_OK(hms_client.GetTable("default", p.first, &table));
+    ASSERT_OK(hms_client->GetTable("default", p.first, &table));
     ASSERT_EQ(p.second, table.owner);
   }
 }
@@ -7884,9 +7886,11 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
   hms_opts.verify_service_config = false;
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -7920,7 +7924,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "non_existent_database.table"));
 
   // Test case: a legacy table with a Hive name which conflicts with another table in Kudu.
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "conflicting_legacy_table",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "conflicting_legacy_table",
         "impala::default.conflicting_legacy_table",
         master_addr, HmsClient::kManagedTable, kUsername));
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.conflicting_legacy_table"));
@@ -7978,7 +7982,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   // Create the missing database.
   hive::Database db;
   db.name = "non_existent_database";
-  ASSERT_OK(hms_client.CreateDatabase(db));
+  ASSERT_OK(hms_client->CreateDatabase(db));
 
   // Rename the conflicting table.
   NO_FATALS(RunActionStdoutNone(Substitute(
@@ -8013,8 +8017,9 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
 
   thrift::ClientOptions hms_opts;
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
 
   shared_ptr<KuduClient> kudu_client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &kudu_client));
@@ -8035,7 +8040,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   {
     std::reverse(master_addrs.begin(), master_addrs.end());
     hive::Table hms_table_reversed_masters;
-    ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+    ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
         HmsClient::kKuduMasterAddrsKey, JoinStrings(master_addrs, ",")));
     NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
   }
@@ -8046,7 +8051,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   // aren't quite right that overlap with the correct set of masters (e.g. in
   // the case of a multi-master migration).
   // Try with an extra master.
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
       HmsClient::kKuduMasterAddrsKey, Substitute("$0,other_master_addr", master_addrs_str)));
   Status s = RunActionStdoutStderrString(
       Substitute("hms check $0", master_addrs_str), &out, &err);
@@ -8055,7 +8060,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
 
   // And with a missing master.
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
       HmsClient::kKuduMasterAddrsKey, cluster_->master_rpc_addrs()[0].ToString()));
   s = RunActionStdoutStderrString(Substitute("hms check $0", master_addrs_str), &out, &err);
   ASSERT_STR_CONTAINS(out, "default.table");
@@ -8063,7 +8068,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
 
   // Set the masters to point to an entirely different set of masters.
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
       HmsClient::kKuduMasterAddrsKey, "other_master_addrs"));
 
   // The check tool will ignore the HMS metadata from the other cluster, and
@@ -8193,9 +8198,11 @@ TEST_F(ToolTest, TestHmsList) {
   thrift::ClientOptions hms_opts;
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -8267,9 +8274,11 @@ TEST_F(ToolTest, TestHMSAddressLog) {
   thrift::ClientOptions hms_opts;
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+
+  unique_ptr<hms::HmsClient> hms_client;
+  ASSERT_OK(hms::HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();

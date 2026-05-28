@@ -51,6 +51,10 @@ static constexpr const char* kHmsTlsKeyStorePassword = "storepass";
 namespace kudu {
 namespace hms {
 
+string MiniHms::BuildCaCertFilePath(const string& data_root) {
+  return JoinPathSegments(data_root, "ca-cert.pem");
+}
+
 MiniHms::MiniHms() {
 }
 
@@ -230,6 +234,18 @@ string MiniHms::uris() const {
   return Substitute("thrift://127.0.0.1:$0", port_);
 }
 
+string MiniHms::ca_cert_file_path() const {
+  DCHECK(!data_root_.empty());
+  DCHECK(tls_enabled_);
+  return BuildCaCertFilePath(data_root_);
+}
+
+string MiniHms::ca_keystore_path() const {
+  DCHECK(!data_root_.empty());
+  DCHECK(tls_enabled_);
+  return JoinPathSegments(data_root_, "ca-keystore.p12");
+}
+
 Status MiniHms::CreateSecurityProperties() const {
   // Default Java security settings are restrictive with regard to RSA key
   // length. Since Kudu masters and tablet servers in MiniKuduCluster use
@@ -250,19 +266,18 @@ Status MiniHms::CreateSecurityProperties() const {
 }
 
 Status MiniHms::CreateTlsKeyStore(const string& java_home) {
-  constexpr const char* kCaAlias = "mini-hms-ca";
-  constexpr const char* kServerAlias = "mini-hms-server";
-  const string ca_key_store = JoinPathSegments(data_root_, "ca-keystore.p12");
+  constexpr const char* const kCaAlias = "mini-hms-ca";
+  constexpr const char* const kServerAlias = "mini-hms-server";
+
+  DCHECK(!data_root_.empty());
+  const string ca_key_store = ca_keystore_path();
   const string server_key_store = JoinPathSegments(data_root_, "server-keystore.p12");
-  const string ca_cert = JoinPathSegments(data_root_, "ca-cert.pem");
+  const string ca_cert = ca_cert_file_path();
   const string server_csr = JoinPathSegments(data_root_, "mini-hms-server-csr.pem");
   const string server_cert = JoinPathSegments(data_root_, "mini-hms-server-cert.pem");
   // The marker is written only after all keytool steps succeed, so a retry can
   // distinguish a complete keystore from artifacts left by a partial attempt.
   const string success_marker = JoinPathSegments(data_root_, "mini-hms-tls-keystore-ready");
-  const vector<string> tls_artifacts = {
-      ca_key_store, server_key_store, ca_cert, server_csr, server_cert, success_marker
-  };
 
   key_store_path_ = server_key_store;
   key_store_password_ = kHmsTlsKeyStorePassword;
@@ -272,13 +287,9 @@ Status MiniHms::CreateTlsKeyStore(const string& java_home) {
     return Status::OK();
   }
 
-  // Clean up leftovers from an earlier failed attempt before invoking keytool.
-  for (const auto& path : tls_artifacts) {
-    if (env->FileExists(path)) {
-      RETURN_NOT_OK(env->DeleteFile(path));
-    }
-  }
-
+  const vector<string> tls_artifacts = {
+      ca_key_store, server_key_store, ca_cert, server_csr, server_cert, success_marker
+  };
   auto delete_tls_artifacts = MakeScopedCleanup([&] {
     for (const auto& path : tls_artifacts) {
       if (env->FileExists(path)) {

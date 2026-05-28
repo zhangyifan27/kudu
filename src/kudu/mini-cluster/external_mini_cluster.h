@@ -353,6 +353,9 @@ struct ExternalMiniClusterOptions {
 // of the daemons.
 class ExternalMiniCluster : public MiniCluster {
  public:
+  // The absolute path to the default cluster root location.
+  static std::string GetDefaultClusterRoot();
+
   // Constructs a cluster with the default options.
   ExternalMiniCluster();
 

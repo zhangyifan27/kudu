@@ -18,14 +18,28 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/gutil/port.h"
 #include "kudu/hms/ThriftHiveMetastore.h"
-#include "kudu/hms/hive_metastore_types.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+
+namespace apache {
+namespace thrift {
+namespace protocol {
+class TProtocol;
+}  // namespace protocol
+}  // namespace thrift
+}  // namespace apache
+namespace hive {
+class Database;
+class EnvironmentContext;
+class NotificationEvent;
+class Partition;
+class Table;
+}  // namespace hive
 
 namespace kudu {
 
@@ -53,7 +67,7 @@ enum class Cascade {
 // retry on failure. If higher-level features like thread-safety, retrying, and
 // HA support are needed then use thrift::HaClient<HmsClient> to wrap the HMS
 // client.
-class HmsClient {
+class HmsClient final {
  public:
 
   static const char* const kExternalTableKey;
@@ -89,8 +103,14 @@ class HmsClient {
   static const char* const kKuduOutputFormat;
   static const char* const kKuduSerDeLib;
 
-  // Create an HmsClient connection to the provided HMS Thrift RPC address.
-  HmsClient(const HostPort& address, const thrift::ClientOptions& options);
+  // Create a new HmsClient instance allocated on the heap, configured as
+  // specified by 'options'. Success case: returns Status::OK(), and 'client'
+  // contains a new HmsClient instance wrapped into std::unique_ptr.
+  // Failure case: returns non-OK status, and the 'client' output parameter
+  // stays untouched.
+  static Status New(const HostPort& address,
+                    const thrift::ClientOptions& options,
+                    std::unique_ptr<HmsClient>* client);
   ~HmsClient();
 
   // Starts the HMS client.
@@ -205,7 +225,14 @@ class HmsClient {
   static Status DeserializeJsonTable(Slice json, hive::Table* table);
 
  private:
-  bool verify_kudu_sync_config_;
+  // Create an HmsClient connection to the provided HMS Thrift RPC address.
+  HmsClient(const HostPort& address, const thrift::ClientOptions& options);
+
+  // Create an HmsClient based on the specified TProtocol object.
+  HmsClient(std::shared_ptr<::apache::thrift::protocol::TProtocol> protocol,
+            const thrift::ClientOptions& options);
+
+  const bool verify_kudu_sync_config_;
   hive::ThriftHiveMetastoreClient client_;
 };
 } // namespace hms

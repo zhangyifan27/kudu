@@ -38,6 +38,7 @@
 
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -62,6 +63,7 @@ TAG_FLAG(disable_hms_incompatible_column_type_check, hidden);
 using apache::thrift::TApplicationException;
 using apache::thrift::TException;
 using apache::thrift::protocol::TJSONProtocol;
+using apache::thrift::protocol::TProtocol;
 using apache::thrift::transport::TMemoryBuffer;
 using apache::thrift::transport::TTransportException;
 using kudu::iequals;
@@ -69,6 +71,7 @@ using kudu::thrift::ClientOptions;
 using kudu::thrift::CreateClientProtocol;
 using kudu::thrift::SaslException;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -156,6 +159,53 @@ const uint16_t HmsClient::kDefaultHmsPort = 9083;
 const int kSlowExecutionWarningThresholdMs = 1000;
 
 const char* const HmsClient::kServiceName = "Hive Metastore";
+
+Status HmsClient::New(const HostPort& address,
+                      const thrift::ClientOptions& options,
+                      unique_ptr<HmsClient>* client) {
+  DCHECK(client);
+  try {
+    auto protocol = CreateClientProtocol(address, options);
+    if (PREDICT_FALSE(!protocol)) {
+      return Status::IllegalState("could not create Thrift client protocol");
+    }
+    unique_ptr<HmsClient> new_client(new HmsClient(std::move(protocol), options));
+
+    // Check for the availability of I/O transports in the newly created
+    // HmsClient instance.
+    {
+      auto iproto = new_client->client_.getInputProtocol();
+      if (PREDICT_FALSE(!iproto)) {
+        return Status::IllegalState("null input protocol");
+      }
+      auto itr = iproto->getTransport();
+      if (PREDICT_FALSE(!itr)) {
+        return Status::IllegalState("null transport for input protocol");
+      }
+      auto oproto = new_client->client_.getOutputProtocol();
+      if (PREDICT_FALSE(!oproto)) {
+        return Status::IllegalState("null output protocol");
+      }
+      auto otr = oproto->getTransport();
+      if (PREDICT_FALSE(!otr)) {
+        return Status::IllegalState("null transport for output protocol");
+      }
+    }
+
+    *client = std::move(new_client);
+  } catch (const TException& ex) {
+    return Status::IllegalState("could not create HmsClient", ex.what());
+  } catch (const std::exception& ex) {
+    return Status::RuntimeError("could not create HmsClient", ex.what());
+  }
+  DCHECK(*client);
+  return Status::OK();
+}
+
+HmsClient::HmsClient(shared_ptr<TProtocol> protocol, const ClientOptions& options)
+      : verify_kudu_sync_config_(options.verify_service_config),
+        client_(hive::ThriftHiveMetastoreClient(std::move(protocol))) {
+}
 
 HmsClient::HmsClient(const HostPort& address, const ClientOptions& options)
       : verify_kudu_sync_config_(options.verify_service_config),

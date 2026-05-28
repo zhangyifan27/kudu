@@ -19,10 +19,10 @@
 
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,6 +75,14 @@ struct ClientOptions {
   // Must be set if kerberos is enabled.
   std::string service_principal;
 
+  // Whether to protect connections with TLS/SSL.
+  bool enable_tls = false;
+
+  // The absolute path to a file with trusted CA certificates to verify
+  // Hive Metastore's server certificate used for TLS protection of Thrift
+  // connections.
+  std::string tls_trusted_ca_cert_file;
+
   // Maximum size of objects which can be received on the Thrift connection.
   // Defaults to 100MiB to match Thrift TSaslTransport.receiveSaslMessage.
   int32_t max_buf_size = 100 * 1024 * 1024;
@@ -102,7 +110,7 @@ bool IsFatalError(const Status& error);
 //
 // This class is thread safe after Start() is called.
 template<typename Service>
-class HaClient {
+class HaClient final {
  public:
 
   HaClient();
@@ -134,7 +142,7 @@ class HaClient {
   ClientOptions options_;
 
   // The actual client service instance (ex: HmsClient).
-  Service service_client_;
+  std::unique_ptr<Service> service_client_;
 
   // Fields which track consecutive reconnection attempts and backoff.
   MonoTime reconnect_after_;
@@ -154,8 +162,7 @@ class HaClient {
 
 template<typename Service>
 HaClient<Service>::HaClient()
-    : service_client_(HostPort("", 0), options_),
-      reconnect_after_(MonoTime::Now()),
+    : reconnect_after_(MonoTime::Now()),
       reconnect_failure_(Status::OK()),
       consecutive_reconnect_failures_(0),
       reconnect_idx_(0) {
@@ -239,7 +246,7 @@ Status HaClient<Service>::Execute(std::function<Status(Service*)> task) {
     Status first_failure;
 
     for (int attempt = 0; attempt <= options_.retry_count; attempt++) {
-      if (!service_client_.IsConnected()) {
+      if (!service_client_ || !service_client_->IsConnected()) {
         if (reconnect_after_ > MonoTime::Now()) {
           // Not yet ready to attempt reconnection; fail the task immediately.
           DCHECK(!reconnect_failure_.ok());
@@ -268,7 +275,7 @@ Status HaClient<Service>::Execute(std::function<Status(Service*)> task) {
       }
 
       // Execute the task.
-      Status task_status = task(&service_client_);
+      Status task_status = task(service_client_.get());
 
       // If the task succeeds, or it's a non-retriable error, return the result.
       if (task_status.ok() || !IsFatalError(task_status)) {
@@ -295,8 +302,11 @@ Status HaClient<Service>::Execute(std::function<Status(Service*)> task) {
         }
       }
 
-      WARN_NOT_OK(service_client_.Stop(),
-                  strings::Substitute("Failed to stop $0 client", Service::kServiceName));
+      if (service_client_) {
+        WARN_NOT_OK(service_client_->Stop(),
+                    strings::Substitute("Failed to stop $0 client", Service::kServiceName));
+        service_client_.reset();
+      }
     }
 
     // We've exhausted the allowed retries.
@@ -340,10 +350,19 @@ Status HaClient<Service>::Reconnect() {
     const auto& address = addresses_[reconnect_idx_];
     reconnect_idx_ = (reconnect_idx_ + 1) % addresses_.size();
 
-    service_client_ = Service(address, options_);
+    {
+      std::unique_ptr<Service> svc;
+      s = Service::New(address, options_, &svc);
+      if (!s.ok()) {
+        WARN_NOT_OK(s, strings::Substitute("could not create client for $0 at $1",
+            Service::kServiceName, address.ToString()));
+        continue;
+      }
+      service_client_ = std::move(svc);
+    }
     VLOG(1) << strings::Substitute(
             "Attempting to connect to $0", address.ToString());
-    s = service_client_.Start();
+    s = service_client_->Start();
     if (s.ok()) {
       VLOG(1) << strings::Substitute(
           "Connected to $0 $1", Service::kServiceName, address.ToString());
@@ -354,8 +373,11 @@ Status HaClient<Service>::Reconnect() {
           Service::kServiceName, address.ToString()));
   }
 
-  WARN_NOT_OK(service_client_.Stop(),
-              strings::Substitute("Failed to stop $0 client", Service::kServiceName));
+  if (service_client_) {
+    WARN_NOT_OK(service_client_->Stop(),
+                strings::Substitute("Failed to stop $0 client", Service::kServiceName));
+    service_client_.reset();
+  }
   return s;
 }
 } // namespace thrift

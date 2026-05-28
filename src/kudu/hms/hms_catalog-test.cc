@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -44,8 +45,11 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-DECLARE_string(hive_metastore_uris);
 DECLARE_bool(hive_metastore_sasl_enabled);
+DECLARE_bool(hive_metastore_tls_enabled);
+DECLARE_bool(hive_metastore_tls_use_https_trusted_ca_cert);
+DECLARE_string(hive_metastore_tls_trusted_ca_cert_file);
+DECLARE_string(hive_metastore_uris);
 
 using kudu::rpc::SaslProtection;
 using std::make_pair;
@@ -124,17 +128,31 @@ class HmsCatalogTest : public KuduTest {
   const char* const kMasterAddrs = "master-addrs";
   const char* const kTableId = "abc123";
 
-  virtual bool EnableKerberos() {
+  virtual bool IsKerberosEnabled() const {
+    return false;
+  }
+
+  virtual bool IsTlsEnabled() const {
     return false;
   }
 
   void SetUp() override {
     KuduTest::SetUp();
-    bool enable_kerberos = EnableKerberos();
-
-    thrift::ClientOptions hms_client_opts;
+    const bool enable_kerberos = IsKerberosEnabled();
+    const bool enable_tls = IsTlsEnabled();
 
     hms_.reset(new hms::MiniHms());
+    hms_->SetDataRoot(GetTestDataDirectory());
+    hms_->EnableTls(enable_tls);
+
+    thrift::ClientOptions hms_client_opts;
+    hms_client_opts.enable_tls = enable_tls;
+    FLAGS_hive_metastore_tls_enabled = enable_tls;
+    if (enable_tls) {
+      hms_client_opts.tls_trusted_ca_cert_file = hms_->ca_cert_file_path();
+      FLAGS_hive_metastore_tls_trusted_ca_cert_file = hms_->ca_cert_file_path();
+      FLAGS_hive_metastore_tls_use_https_trusted_ca_cert = false;
+    }
 
     // Set the `KUDU_HMS_SYNC_ENABLED` environment variable in the
     // HMS environment to manually enable HMS synchronization checks.
@@ -167,8 +185,11 @@ class HmsCatalogTest : public KuduTest {
     }
 
     ASSERT_OK(hms_->Start());
-
-    hms_client_.reset(new HmsClient(hms_->address(), hms_client_opts));
+    {
+      unique_ptr<HmsClient> client;
+      ASSERT_OK(HmsClient::New(hms_->address(), hms_client_opts, &client));
+      hms_client_ = std::move(client);
+    }
     ASSERT_OK(hms_client_->Start());
 
     FLAGS_hive_metastore_uris = hms_->uris();
@@ -290,20 +311,28 @@ class HmsCatalogTest : public KuduTest {
 };
 
 // Subclass of HmsCatalogTest that allows running individual test cases with
-// Kerberos enabled and disabled. Most of the test cases are run only with
-// Kerberos disabled, but to get coverage against a Kerberized HMS we run select
-// cases in both modes.
-class HmsCatalogTestParameterized : public HmsCatalogTest,
-                                    public ::testing::WithParamInterface<bool> {
-  bool EnableKerberos() override {
-    return GetParam();
+// Kerberos enabled and disabled, combined with TLS enabled/disabled.
+// Most of the test cases are run only with Kerberos disabled, but to get
+// coverage against a Kerberized HMS we run select cases in both modes.
+// The TLS support for Thrift connections is orthogonal to Kerberos being
+// enabled/disabled.
+class HmsCatalogKerberosTlsParamTest :
+    public HmsCatalogTest,
+    public ::testing::WithParamInterface<std::tuple<bool, bool>> {
+  bool IsKerberosEnabled() const override {
+    return std::get<0>(GetParam());
+  }
+  bool IsTlsEnabled() const override {
+    return std::get<1>(GetParam());
   }
 };
-INSTANTIATE_TEST_SUITE_P(HmsCatalogTests, HmsCatalogTestParameterized,
-                         ::testing::Values(false, true));
+INSTANTIATE_TEST_SUITE_P(HmsCatalogTests,
+                         HmsCatalogKerberosTlsParamTest,
+                         ::testing::Combine(::testing::Bool(),  // Kerberos
+                                            ::testing::Bool())); // TLS
 
 // Test creating, altering, and dropping a table with the HMS Catalog.
-TEST_P(HmsCatalogTestParameterized, TestTableLifecycle) {
+TEST_P(HmsCatalogKerberosTlsParamTest, TestTableLifecycle) {
   const string kTableId = "table-id";
   const string kClusterId = "cluster-id";
   const string kHmsDatabase = "default";
@@ -345,9 +374,19 @@ TEST_P(HmsCatalogTestParameterized, TestTableLifecycle) {
   NO_FATALS(CheckTableDoesNotExist(kHmsDatabase, kHmsAlteredTableName));
 }
 
+class HmsCatalogTlsParamTest :
+    public HmsCatalogTest, public ::testing::WithParamInterface<bool> {
+  bool IsTlsEnabled() const override {
+    return GetParam();
+  }
+};
+INSTANTIATE_TEST_SUITE_P(HmsCatalogTests,
+                         HmsCatalogTlsParamTest,
+                         ::testing::Bool());
+
 // Checks that Kudu tables will not replace or modify existing HMS entries that
 // belong to external tables from other systems.
-TEST_F(HmsCatalogTest, TestExternalTable) {
+TEST_P(HmsCatalogTlsParamTest, TestExternalTable) {
   const string kTableId = "table-id";
   const string kClusterId = "cluster-id";
   const string kComment = "comment";
@@ -448,7 +487,7 @@ TEST_F(HmsCatalogTest, TestGetKuduTables) {
 }
 
 // Checks that the HmsCatalog handles reconnecting to the metastore after a connection failure.
-TEST_F(HmsCatalogTest, TestReconnect) {
+TEST_P(HmsCatalogTlsParamTest, TestReconnect) {
   // TODO(dan): Figure out a way to test failover among HA HMS instances. The
   // MiniHms does not support HA, since it relies on a single-process Derby database.
 
@@ -530,7 +569,7 @@ TEST_F(HmsCatalogTest, TestMetastoreUuid) {
   });
 }
 
-TEST_F(HmsCatalogTest, TestArrayTypes) {
+TEST_P(HmsCatalogTlsParamTest, TestArrayTypes) {
   const string kTableId = "test-array-table-id";
   const string kClusterId = "test-cluster-id";
   const string kComment = "array types table";
