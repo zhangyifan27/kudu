@@ -61,7 +61,7 @@ dependencies {
   // Needed for CapturingLogAppender. Optional otherwise.
   compileOnlyApi libs.log4jApi
   compileOnlyApi libs.log4jCore
-  compileOnlyApi libs.log4jSlf4jImpl
+  compileOnlyApi libs.log4jSlf4j2Impl
 
   compileOnlyApi libs.jsr305
   compileOnlyApi libs.yetusAnnotations
@@ -78,7 +78,7 @@ dependencies {
   testImplementation libs.hamcrest
   testImplementation libs.log4jApi
   testImplementation libs.log4jCore
-  testImplementation libs.log4jSlf4jImpl
+  testImplementation libs.log4jSlf4j2Impl
 }
 
 shadowJar {
@@ -86,7 +86,7 @@ shadowJar {
     exclude(dependency(libs.jsr305))
     exclude(dependency(libs.log4jApi))
     exclude(dependency(libs.log4jCore))
-    exclude(dependency(libs.log4jSlf4jImpl))
+    exclude(dependency(libs.log4jSlf4j2Impl))
     exclude(dependency(libs.junit))
     exclude(dependency("org.jacoco::.*"))
   }

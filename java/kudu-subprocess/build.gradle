@@ -47,7 +47,7 @@ dependencies {
   implementation libs.log4jApi
   implementation libs.log4jCore
   implementation libs.log4jCompat
-  implementation libs.log4jSlf4jImpl
+  implementation libs.log4jSlf4j2Impl
 
   // Compiling exact modules from the io.netty group for hadoop-common:
   // for some reason, if compiling just the libs.netty umbrella package

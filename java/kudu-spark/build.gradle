@@ -36,7 +36,7 @@ dependencies {
   testImplementation libs.scalatest
   testImplementation libs.log4jApi
   testImplementation libs.log4jCore
-  testImplementation libs.log4jSlf4jImpl
+  testImplementation libs.log4jSlf4j2Impl
 
   // Have to re-define some dependencies here, as compile-only dependencies
   // are not inherited by the test classpath.
