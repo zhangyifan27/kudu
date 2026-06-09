@@ -210,7 +210,7 @@ Status SubprocessProtocol::DoReadAndDiscard(ssize_t size) const {
   ssize_t rem = size;
   while (rem > 0) {
     ssize_t r;
-    RETRY_ON_EINTR(r, read(read_fd_, buf, std::max<ssize_t>(rem, sizeof(buf))));
+    RETRY_ON_EINTR(r, read(read_fd_, buf, std::min<ssize_t>(rem, sizeof(buf))));
     if (r == -1) {
       const int err = errno;
       return Status::IOError("Error reading from pipe", "", err);

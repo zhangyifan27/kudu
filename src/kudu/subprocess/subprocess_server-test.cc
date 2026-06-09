@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <unistd.h>
+
+#include <cstdint>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -33,6 +36,7 @@
 #include "kudu/subprocess/echo_subprocess.h"
 #include "kudu/subprocess/server.h"
 #include "kudu/subprocess/subprocess.pb.h"
+#include "kudu/subprocess/subprocess_protocol.h"
 #include "kudu/util/env.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -464,6 +468,105 @@ TEST_F(SubprocessServerTest, LargePayloadSize) {
     SubprocessResponsePB res;
     ASSERT_OK(server_->Execute(&req, &res));
   }
+}
+
+// Regression test for the buffer-overflow / over-read bug in
+// SubprocessProtocol::DoReadAndDiscard(), which used
+// std::max<ssize_t>(rem, sizeof(buf)) for read instead of std::min().
+// These tests drive SubprocessProtocol directly over a pipe (no Java
+// subprocess involved) so the oversized-message discard path is
+// exercised deterministically.
+class SubprocessProtocolTest : public KuduTest {};
+
+// When an oversized message is discarded, DoReadAndDiscard() must consume
+// *exactly* the oversized payload and no more. With the 'std::max' bug, the
+// discard read pulls up to sizeof(buf) (4096) bytes even when the oversized
+// payload is smaller, swallowing the bytes of the *following* well-formed
+// message and desynchronizing the channel.
+//
+// This test fails deterministically against the buggy code (the follow-up
+// message is lost and the next read hits EOF) and passes once the read is
+// bounded by std::min().
+TEST_F(SubprocessProtocolTest, OversizedMessageDoesNotOverReadFollowingMessage) {
+  int fds[2];
+  PCHECK(pipe(fds) == 0);
+  const int read_fd = fds[0];
+  const int write_fd = fds[1];
+  SCOPED_CLEANUP({ close(read_fd); });
+
+  // Cap the reader at 150 bytes: large enough to accept a tiny request, small
+  // enough to reject one carrying a few hundred payload bytes.
+  constexpr uint32_t kMaxMsgBytes = 150;
+
+  // The oversized payload is intentionally well under sizeof(buf) (4096) so
+  // that the buggy std::max() read over-reads into the following message
+  // rather than overflowing the stack buffer (that case is covered below).
+  SubprocessRequestPB send_oversized_req = CreateEchoSubprocessRequestPB(string(300, 'x'));
+  SubprocessRequestPB send_valid_req = CreateEchoSubprocessRequestPB("legit request");
+
+  {
+    SubprocessProtocol writer(SubprocessProtocol::SerializationMode::PB,
+                              SubprocessProtocol::CloseMode::NO_CLOSE_ON_DESTROY,
+                              -1, write_fd, 0);
+    ASSERT_OK(writer.SendMessage(send_oversized_req));
+    ASSERT_OK(writer.SendMessage(send_valid_req));
+  }
+  // Close the write end so that, if the follow-up message is wrongly consumed
+  // while discarding, the reader observes EOF instead of blocking forever.
+  PCHECK(close(write_fd) == 0);
+
+  SubprocessProtocol reader(SubprocessProtocol::SerializationMode::PB,
+                            SubprocessProtocol::CloseMode::NO_CLOSE_ON_DESTROY,
+                            read_fd, -1, kMaxMsgBytes);
+
+  // The first message is rejected as oversized; its payload must be discarded.
+  SubprocessRequestPB received_oversized_req;
+  Status s = reader.ReceiveMessage(&received_oversized_req);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "exceeds maximum message size");
+
+  // The following well-formed message must still be intact. With the bug it
+  // is swallowed during the discard, so this read returns EOF.
+  SubprocessRequestPB received_valid_req;
+  ASSERT_OK(reader.ReceiveMessage(&received_valid_req));
+  EchoRequestPB echo;
+  ASSERT_TRUE(received_valid_req.request().UnpackTo(&echo));
+  ASSERT_EQ("legit request", echo.data());
+}
+
+// When the oversized payload is larger than the 4096-byte stack buffer, the buggy
+// 'std::max()' limit check makes read() to copy 'rem' (the full payload size) bytes
+// into a 4096-byte stack array in a single call, smashing the stack. This is
+// caught by ASAN. With the 'std::min()' fix the payload is discarded in bounded
+// chunks and the call simply reports the oversized error. The std::min limit
+// aligns with java implementation of doReadAndDiscard as well.
+TEST_F(SubprocessProtocolTest, OversizedMessageDiscardDoesNotOverflowStackBuffer) {
+  int fds[2];
+  PCHECK(pipe(fds) == 0);
+  const int read_fd = fds[0];
+  const int write_fd = fds[1];
+  SCOPED_CLEANUP({ close(read_fd); });
+
+  constexpr uint32_t kMaxMsgBytes = 150;
+  // 8K payload: comfortably larger than the 4096-byte buffer so a single read()
+  // call flows over it.
+  SubprocessRequestPB send_oversized_req = CreateEchoSubprocessRequestPB(string(8 * 1024, 'x'));
+
+  {
+    SubprocessProtocol writer(SubprocessProtocol::SerializationMode::PB,
+                              SubprocessProtocol::CloseMode::NO_CLOSE_ON_DESTROY,
+                              -1, write_fd, 0);
+    ASSERT_OK(writer.SendMessage(send_oversized_req));
+  }
+  PCHECK(close(write_fd) == 0);
+
+  SubprocessProtocol reader(SubprocessProtocol::SerializationMode::PB,
+                            SubprocessProtocol::CloseMode::NO_CLOSE_ON_DESTROY,
+                            read_fd, -1, kMaxMsgBytes);
+  SubprocessRequestPB got;
+  Status s = reader.ReceiveMessage(&got);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "exceeds maximum message size");
 }
 
 } // namespace subprocess
