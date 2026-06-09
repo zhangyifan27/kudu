@@ -29,7 +29,6 @@ PROTOBUF_GENERATE_CPP(
     replica_management.proto)
 set(METADATA_PROTO_LIBS
   kudu_common_proto
-  fs_proto
   protobuf)
 ADD_EXPORTABLE_LIBRARY(consensus_metadata_proto
   SRCS ${METADATA_PROTO_SRCS}
