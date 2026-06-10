@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -608,6 +609,56 @@ TEST_F(HmsClientTest, TlsEnabledOnlyOnServer) {
   // The client side is able to close the connection without an issue.
   ASSERT_TRUE(client->IsConnected());
   ASSERT_OK(client->Stop());
+}
+
+TEST_F(HmsClientTest, TlsEnabledOnlyOnKerberizedServer) {
+  MiniKdc kdc;
+  ASSERT_OK(kdc.Start());
+
+  const string spn = "hive/127.0.0.1";
+  string ktpath;
+  ASSERT_OK(kdc.CreateServiceKeytab(spn, &ktpath));
+
+  ASSERT_OK(rpc::SaslInit());
+
+  ASSERT_OK(kdc.CreateUserPrincipal("alice"));
+  ASSERT_OK(kdc.Kinit("alice"));
+  ASSERT_OK(kdc.SetKrb5Environment());
+  thrift::ClientOptions hms_client_opts;
+  hms_client_opts.enable_tls = false;
+  hms_client_opts.enable_kerberos = true;
+  hms_client_opts.service_principal = "hive";
+
+  for (const auto sasl_protection_type : { SaslProtection::kAuthentication,
+                                           SaslProtection::kIntegrity,
+                                           SaslProtection::kPrivacy, }) {
+    SCOPED_TRACE(SaslProtection::name_of(sasl_protection_type));
+
+    MiniHms hms;
+    hms.EnableKerberos(kdc.GetEnvVars()["KRB5_CONFIG"],
+                       spn,
+                       ktpath,
+                       sasl_protection_type);
+    ASSERT_OK(StartHmsNoCluster(&hms, /*tls_enabled=*/true));
+
+    unique_ptr<HmsClient> client;
+    ASSERT_OK(HmsClient::New(hms.address(), hms_client_opts, &client));
+    ASSERT_NE(nullptr, client.get());
+
+    // As expected, the communication fails: the server expects a TLS handshake
+    // to start, but the client expects regular message exchange to negotiate
+    // correspondg protection level via SASL. While at the server side the
+    // "javax.net.ssl.SSLException: Unsupported or unrecognized SSL message"
+    // error is wrapped into org.apache.thrift.transport.TTransportException,
+    // at the client side this results in unexpected SASL status.
+    const auto s = client->Start();
+    ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "failed to open Hive Metastore connection");
+    ASSERT_STR_CONTAINS(s.ToString(), "Unexpected SASL status: 21");
+    ASSERT_FALSE(client->IsConnected());
+    ASSERT_OK(client->Stop());
+    ASSERT_OK(hms.Stop());
+  }
 }
 
 TEST_F(HmsClientTest, TlsEnabledOnlyOnClient) {
