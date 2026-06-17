@@ -83,5 +83,4 @@ tasks.withType(Checkstyle).configureEach {
   enabled = false
 }
 // Skip publishing kudu-flatbuffers artifact because it will always be shaded into kudu-client.
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()

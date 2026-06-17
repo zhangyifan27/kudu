@@ -41,5 +41,4 @@ javadoc {
 }
 
 // Skip publishing kudu-proto artifact because it will always be shaded into kudu-client.
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()

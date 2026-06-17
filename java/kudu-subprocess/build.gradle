@@ -74,8 +74,7 @@ javadoc {
 }
 
 // Skip publishing kudu-subprocess artifact because it's not intended for external use.
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()
 
 shadowJar {
     // It tells the Shadow plugin to find all files in META-INF/services/ across all dependency

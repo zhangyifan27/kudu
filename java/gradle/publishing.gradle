@@ -38,6 +38,19 @@ ext {
   mavenPublishUrl = propertyWithDefault("mavenPublishUrl", "")
   mavenUsername = propertyWithDefault("mavenUsername", "")
   mavenPassword = propertyWithDefault("mavenPassword", "")
+
+  disablePublishing = {
+    // Disable both lifecycle publish tasks and per-publication tasks. Disabling
+    // only the lifecycle tasks still lets their dependencies publish artifacts.
+    tasks.matching { task ->
+      task.name == "publish" ||
+          task.name == "publishToMavenLocal" ||
+          task.name.startsWith("publishAllPublicationsTo") ||
+          (task.name.startsWith("publish") && task.name.contains("PublicationTo"))
+    }.configureEach {
+      enabled = false
+    }
+  }
 }
 
 publishing {
@@ -180,4 +193,3 @@ signing {
 
 // Add the install task to the "Upload" group so it's visible in the tasks output.
 publish.group = "Upload"
-

@@ -69,8 +69,7 @@ task runJepsen(type: JavaExec) {
 }
 
 // We don't publish kudu-jepsen
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()
 
 // SpotBugs doesn't work on Clojure.
 spotbugsMain.enabled = false
